@@ -83,3 +83,4 @@ logs/
 .Trashes
 Thumbs.db
 desktop.ini
+models/*.bak

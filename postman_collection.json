@@ -1,0 +1,132 @@
+{
+  "info": {
+    "name": "Luxembourg Traffic Forecast (local)",
+    "description": "Local API for the 2024-trained hourly traffic forecast model. Import into Postman, then set the base_url variable if you are not on port 8000.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8000" }
+  ],
+  "item": [
+    {
+      "name": "health",
+      "request": { "method": "GET", "url": { "raw": "{{base_url}}/health", "host": ["{{base_url}}"], "path": ["health"] } }
+    },
+    {
+      "name": "counters (lists all 1058 valid poste_id / direction / vehicule)",
+      "request": { "method": "GET", "url": { "raw": "{{base_url}}/counters", "host": ["{{base_url}}"], "path": ["counters"] } }
+    },
+    {
+      "name": "forecast - busiest counter 1410 cars",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/forecast?poste_id=1410&direction=1&vehicule=V&date=2025-03-12",
+          "host": ["{{base_url}}"], "path": ["forecast"],
+          "query": [
+            { "key": "poste_id", "value": "1410" },
+            { "key": "direction", "value": "1" },
+            { "key": "vehicule", "value": "V" },
+            { "key": "date", "value": "2025-03-12" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "forecast - quiet truck counter 26",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/forecast?poste_id=26&direction=1&vehicule=C&date=2025-01-09",
+          "host": ["{{base_url}}"], "path": ["forecast"],
+          "query": [
+            { "key": "poste_id", "value": "26" },
+            { "key": "direction", "value": "1" },
+            { "key": "vehicule", "value": "C" },
+            { "key": "date", "value": "2025-01-09" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "forecast - public holiday (New Year 2025)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/forecast?poste_id=1410&direction=1&vehicule=V&date=2025-01-01",
+          "host": ["{{base_url}}"], "path": ["forecast"],
+          "query": [
+            { "key": "poste_id", "value": "1410" },
+            { "key": "direction", "value": "1" },
+            { "key": "vehicule", "value": "V" },
+            { "key": "date", "value": "2025-01-01" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "forecast - regime-change counter 345 (model over-predicts ~52%)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/forecast?poste_id=345&direction=2&vehicule=V&date=2025-06-11",
+          "host": ["{{base_url}}"], "path": ["forecast"],
+          "query": [
+            { "key": "poste_id", "value": "345" },
+            { "key": "direction", "value": "2" },
+            { "key": "vehicule", "value": "V" },
+            { "key": "date", "value": "2025-06-11" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "ERROR - unknown counter (expect 404)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/forecast?poste_id=999999&direction=1&vehicule=V&date=2025-03-12",
+          "host": ["{{base_url}}"], "path": ["forecast"],
+          "query": [
+            { "key": "poste_id", "value": "999999" },
+            { "key": "direction", "value": "1" },
+            { "key": "vehicule", "value": "V" },
+            { "key": "date", "value": "2025-03-12" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "ERROR - bad vehicule (expect 422)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/forecast?poste_id=1410&direction=1&vehicule=X&date=2025-03-12",
+          "host": ["{{base_url}}"], "path": ["forecast"],
+          "query": [
+            { "key": "poste_id", "value": "1410" },
+            { "key": "direction", "value": "1" },
+            { "key": "vehicule", "value": "X" },
+            { "key": "date", "value": "2025-03-12" }
+          ]
+        }
+      }
+    },
+    {
+      "name": "ERROR - bad date (returns 404, should be 422)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{base_url}}/forecast?poste_id=1410&direction=1&vehicule=V&date=not-a-date",
+          "host": ["{{base_url}}"], "path": ["forecast"],
+          "query": [
+            { "key": "poste_id", "value": "1410" },
+            { "key": "direction", "value": "1" },
+            { "key": "vehicule", "value": "V" },
+            { "key": "date", "value": "not-a-date" }
+          ]
+        }
+      }
+    }
+  ]
+}

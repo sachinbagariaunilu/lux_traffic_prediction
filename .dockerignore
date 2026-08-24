@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+.git/
+data/
+*.ipynb
+notebooks/
+
+# build-time only -- the container reads the .pkl, never the source CSVs
+scripts/
+*.bak
+models/*.bak
+
+# local tooling
+docker-compose.yml
+postman_collection.json
+*.md

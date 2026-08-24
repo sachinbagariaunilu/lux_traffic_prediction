@@ -1,0 +1,16 @@
+services:
+  api:
+    build: .
+    image: luxtransport:local
+    container_name: luxtransport
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_PATH: models/forecast_model_2024.pkl
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
