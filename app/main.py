@@ -1,14 +1,56 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 import joblib
 
 from app.forecast import forecast_dates
 
 app = FastAPI(title='Luxembourg Traffic Forecast', version='1.0')
-app.add_middleware(CORSMiddleware, allow_origins='*', allow_methods=['GET'],
+app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['GET'],
                    allow_headers=['*'])
 
 B = joblib.load('models/forecast_model_2024.pkl')
+
+ENDPOINTS = [
+    {"path": "/health", "method": "GET",
+     "description": "service status and which data the model was trained on"},
+    {"path": "/counters", "method": "GET",
+     "description": "every counter the model can forecast, busiest first"},
+    {"path": "/forecast", "method": "GET",
+     "description": "hourly forecast for one counter on one date",
+     "required_params": {
+         "poste_id": "counter id, e.g. 1410 (see /counters)",
+         "direction": "1 or 2",
+         "vehicule": "V for cars, C for trucks",
+         "date": "YYYY-MM-DD"},
+     "example": "/forecast?poste_id=1410&direction=1&vehicule=V&date=2025-03-12"},
+    {"path": "/docs", "method": "GET", "description": "interactive API documentation"},
+]
+
+
+@app.get('/')
+def root():
+    """Landing page -- tells a caller what this service offers."""
+    return {"service": "Luxembourg Traffic Forecast", "version": "1.0",
+            "trained_through": B['trained_through'],
+            "endpoints": ENDPOINTS}
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """On an unknown path, show the caller what they could have asked for.
+
+    Starlette uses the literal detail 'Not Found' when no route matches. A 404
+    raised by a handler (e.g. an unknown counter) carries its own message, so
+    that is passed through untouched rather than buried under a route listing.
+    """
+    if exc.status_code == 404 and exc.detail == "Not Found":
+        return JSONResponse(status_code=404, content={
+            "error": f"Unknown path: {request.url.path}",
+            "hint": "check the spelling, or use one of the endpoints below",
+            "endpoints": ENDPOINTS})
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
 @app.get('/health')
