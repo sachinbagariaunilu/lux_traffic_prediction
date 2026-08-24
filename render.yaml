@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: luxtransport-api
+    runtime: docker
+    plan: free
+    region: frankfurt
+    healthCheckPath: /health
+    envVars:
+      - key: MODEL_PATH
+        value: models/forecast_model_2024.pkl
