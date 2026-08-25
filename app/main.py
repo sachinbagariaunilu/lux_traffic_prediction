@@ -1,6 +1,9 @@
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 import joblib
 
@@ -9,8 +12,19 @@ from app.forecast import forecast_dates
 app = FastAPI(title='Luxembourg Traffic Forecast', version='1.0')
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['GET'],
                    allow_headers=['*'])
+# Every response here is JSON and compresses hard: /counters 306 KB -> 36 KB,
+# /actuals 152 KB -> 58 KB on the busiest counter and ~112 KB -> 37 KB on a
+# typical one. Without this the API serves them raw -- uvicorn compresses
+# nothing of its own, unlike the static host /actuals used to be served from.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 B = joblib.load('models/forecast_model_2024.pkl')
+
+# Recorded hourly counts, one file per counter, written by
+# scripts/build_actuals.py. 2025 only -- 2024 is the training year, so the model
+# reproduces it rather than forecasting it. Read from disk per request rather
+# than held in memory: 30 MB of counts that most callers never ask for.
+ACTUALS = Path('actuals')
 
 ENDPOINTS = [
     {"path": "/health", "method": "GET",
@@ -25,6 +39,9 @@ ENDPOINTS = [
          "vehicule": "V for cars, C for trucks",
          "date": "YYYY-MM-DD"},
      "example": "/forecast?poste_id=1410&direction=1&vehicule=V&date=2025-03-12"},
+    {"path": "/actuals/{poste_id}", "method": "GET",
+     "description": "what the counter actually recorded, hour by hour, 2025 only",
+     "example": "/actuals/1410"},
     {"path": "/docs", "method": "GET", "description": "interactive API documentation"},
 ]
 
@@ -77,6 +94,29 @@ def counters():
          "days_reported": int(r.days_reported),
          "first_day": r.first_day, "last_day": r.last_day} for r in m.itertuples()]}
 
+
+
+@app.get("/actuals/{poste_id}")
+def actuals(poste_id: int):
+    """What this counter actually recorded, hour by hour, for every day of 2025.
+
+    The counterpart to /forecast: that says what the model expects, this says
+    what the road saw, and the difference is the only honest score of the model.
+
+    Shape -- {"poste_id": 1410, "series": {"1-V": {"2025-02-15": [24 ints]}}},
+    keyed "<direction>-<vehicule>" then by date.
+
+    Sent straight off disk rather than parsed and re-serialised; the file is
+    already the response body. A counter with no 2025 days has no file, and 404
+    is the correct answer -- callers are expected to carry on without the line.
+
+    poste_id is typed int, so no caller-supplied text reaches the path.
+    """
+    path = ACTUALS / f"{poste_id}.json"
+    if not path.is_file():
+        raise HTTPException(status_code=404,
+                            detail=f"No recorded 2025 data for counter {poste_id}")
+    return FileResponse(path, media_type="application/json")
 
 
 @app.get("/forecast")
