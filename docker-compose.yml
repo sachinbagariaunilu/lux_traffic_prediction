@@ -5,8 +5,9 @@ services:
     container_name: luxtransport
     ports:
       - "8000:8000"
-    environment:
-      MODEL_PATH: models/forecast_model_2024.pkl
+    # MODEL_PATH is gone: app/main.py loads models/forecast_model.pkl through
+    # forecast.predict.load_bundle(), and the old value pointed at
+    # forecast_model_2024.pkl, which no longer exists.
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 15s

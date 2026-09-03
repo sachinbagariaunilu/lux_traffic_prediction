@@ -1,3 +1,32 @@
+"""Luxembourg traffic forecast API.
+
+Serves a 2024-trained model so a UI can score it against 2025 recorded counts.
+
+ARCHITECTURE -- three files, one source of truth each:
+
+    forecast/            the prediction code, VENDORED from the training repo.
+                         Do not edit here. Copy it over when the model changes,
+                         so the API and the training pipeline can never drift.
+    models/*.pkl         the model bundle.
+    data/external/*.json the calendar, read at CALL TIME. Extending the holiday
+                         file to 2030 needs no retraining and no redeploy of
+                         the .pkl.
+    counter_manifest.json  which counters may be served (see below).
+
+The previous version reimplemented feature construction in app/forecast.py --
+75 lines duplicating forecast/predict.py. It silently built only 12 of the
+model's 14 features and served expected_mae=18.3, a figure that belonged to a
+different model variant entirely. Both classes of bug disappear when there is
+one implementation.
+
+NOTE the bundle pickles a forecast.features.Profiles dataclass, so `forecast`
+must be importable before joblib.load(). uvicorn puts the app root on sys.path,
+which is why `from forecast import predict` works here; a bare script needs to
+insert it (see scripts/build_counter_manifest.py).
+"""
+from __future__ import annotations
+
+import json
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -5,32 +34,48 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
-import joblib
 
-from app.forecast import forecast_dates
+from forecast import predict
 
-app = FastAPI(title='Luxembourg Traffic Forecast', version='1.0')
-app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['GET'],
-                   allow_headers=['*'])
-# Every response here is JSON and compresses hard: /counters 306 KB -> 36 KB,
-# /actuals 152 KB -> 58 KB on the busiest counter and ~112 KB -> 37 KB on a
-# typical one. Without this the API serves them raw -- uvicorn compresses
-# nothing of its own, unlike the static host /actuals used to be served from.
+ROOT = Path(__file__).resolve().parent.parent
+
+app = FastAPI(title="Luxembourg Traffic Forecast", version="2.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"],
+                   allow_headers=["*"])
+# Every response is JSON and compresses hard: /counters 306 KB -> 36 KB.
+# uvicorn compresses nothing of its own.
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-B = joblib.load('models/forecast_model_2024.pkl')
+# Loaded ONCE at import. Correct for a server; never load per request.
+BUNDLE = predict.load_bundle(ROOT / "models" / "forecast_model.pkl")
 
-# Recorded hourly counts, one file per counter, written by
-# scripts/build_actuals.py. 2025 only -- 2024 is the training year, so the model
-# reproduces it rather than forecasting it. Read from disk per request rather
-# than held in memory: 30 MB of counts that most callers never ask for.
-ACTUALS = Path('actuals')
+# Which counters may be served. Built by scripts/build_counter_manifest.py as
+# the INTERSECTION of the 2024 model and the 2025 actuals -- a series missing
+# from either side produces a panel with half the answer, which reads as a
+# broken chart rather than a data boundary. COUNTER_MANIFEST.md records every
+# exclusion and its reason.
+MANIFEST = json.loads((ROOT / "counter_manifest.json").read_text())
+SERVED = {(c["poste_id"], c["direction"], c["vehicule"]) for c in MANIFEST["included"]}
+
+# Recorded 2025 counts, one file per counter. Read from disk per request rather
+# than held in memory: ~30 MB most callers never ask for.
+ACTUALS = ROOT / "actuals"
+
+# The honest accuracy figure. bundle["scores"] is the 46-day Nov-Dec window,
+# which has Christmas as 2 of its 46 days and so flatters anything
+# holiday-related -- it overstated the last feature 4.6x. bundle["holdout"] is
+# the full unseen year. Quote the holdout.
+_HOLDOUT = (BUNDLE.get("holdout") or {}).get("scores") or []
+EXPECTED_MAE = next((s["MAE"] for s in _HOLDOUT if s["Model"].startswith("model")),
+                    None)
 
 ENDPOINTS = [
     {"path": "/health", "method": "GET",
-     "description": "service status and which data the model was trained on"},
+     "description": "service status, model accuracy, and coverage bounds"},
     {"path": "/counters", "method": "GET",
-     "description": "every counter the model can forecast, busiest first"},
+     "description": "counters the UI may show -- present in BOTH 2024 and 2025"},
+    {"path": "/manifest", "method": "GET",
+     "description": "what is served and what is excluded, with reasons"},
     {"path": "/forecast", "method": "GET",
      "description": "hourly forecast for one counter on one date",
      "required_params": {
@@ -42,25 +87,23 @@ ENDPOINTS = [
     {"path": "/actuals/{poste_id}", "method": "GET",
      "description": "what the counter actually recorded, hour by hour, 2025 only",
      "example": "/actuals/1410"},
-    {"path": "/docs", "method": "GET", "description": "interactive API documentation"},
+    {"path": "/docs", "method": "GET", "description": "interactive API docs"},
 ]
 
 
-@app.get('/')
+@app.get("/")
 def root():
-    """Landing page -- tells a caller what this service offers."""
-    return {"service": "Luxembourg Traffic Forecast", "version": "1.0",
-            "trained_through": B['trained_through'],
+    return {"service": "Luxembourg Traffic Forecast", "version": "2.0",
+            "trained_through": BUNDLE["trained_through"],
             "endpoints": ENDPOINTS}
 
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-    """On an unknown path, show the caller what they could have asked for.
+    """On an unknown path, show what could have been asked for.
 
     Starlette uses the literal detail 'Not Found' when no route matches. A 404
-    raised by a handler (e.g. an unknown counter) carries its own message, so
-    that is passed through untouched rather than buried under a route listing.
+    raised by a handler carries its own message and passes through untouched.
     """
     if exc.status_code == 404 and exc.detail == "Not Found":
         return JSONResponse(status_code=404, content={
@@ -70,47 +113,62 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
-@app.get('/health')
+@app.get("/health")
 def health():
-    return {'status':'ok','trained_through':B['trained_through'],
-            'expected_mae':B['expected_mae'],'series':len(B['meta'])}
+    return {
+        "status": "ok",
+        "trained_through": BUNDLE["trained_through"],
+        "features": len(BUNDLE["features"]),
+        # Full unseen year, NOT the 46-day window. See EXPECTED_MAE above.
+        "expected_mae": EXPECTED_MAE,
+        "accuracy_basis": "full unseen year 2025",
+        "series_served": len(SERVED),
+        # The UI must not offer dates past this -- beyond it the three calendar
+        # features would flatten to constants and every Tuesday would return an
+        # identical total, January the same as August.
+        "calendar_from": str(BUNDLE["calendar_from"].date()),
+        "calendar_through": str(BUNDLE["calendar_through"].date()),
+        "scored_through": MANIFEST.get("scored_through", "2025-12-31"),
+    }
 
 
 @app.get("/counters")
 def counters():
-    m = B["meta"].sort_values("avg_per_hour", ascending=False)
-    return {"count": len(m), "counters": [
-        {"poste_id": int(r.POSTE_ID), "direction": int(r.DIRECTION),
-         "vehicule": r.VEHICULE,
-         "label": f"{r.route} — {r.localite} (dir {int(r.DIRECTION)}, "
-                  f"{'cars' if r.VEHICULE == 'V' else 'trucks'})",
-         "route": r.route, "localite": r.localite, "sens": r.sens,
-         # LUREF (EPSG:2169) metres, exactly as recorded in the source CSV.
-         # These are NOT lat/lon -- reproject to WGS84 before using on a map.
-         "coord_x": float(r.coord_x), "coord_y": float(r.coord_y),
-         # avg_per_hour covers days_reported days, NOT the full year -- no
-         # counter reported all 366 days of 2024.
-         "avg_per_hour": round(float(r.avg_per_hour), 1),
-         "days_reported": int(r.days_reported),
-         "first_day": r.first_day, "last_day": r.last_day} for r in m.itertuples()]}
+    """Counters the UI may show: present in BOTH the 2024 model and 2025 actuals.
 
+    Sorted busiest first. `avg_per_hour` covers the hours the counter actually
+    reported in 2024, not the full year -- no counter reported all 366 days.
+    """
+    out = []
+    for c in MANIFEST["included"]:
+        veh = "cars" if c["vehicule"] == "V" else "trucks"
+        out.append({**c,
+                    "label": f"{c['route']} — {c['localite']} "
+                             f"(dir {c['direction']}, {veh})"})
+    return {"count": len(out), "counters": out}
+
+
+@app.get("/manifest")
+def manifest():
+    """What is served and what is held back, with the reason for each.
+
+    Exposed so the UI can state its own coverage instead of implying the
+    network is smaller than it is.
+    """
+    return {"rule": MANIFEST["rule"], "counts": MANIFEST["counts"],
+            "excluded_model_only": MANIFEST["excluded_model_only"],
+            "excluded_actuals_only": MANIFEST["excluded_actuals_only"]}
 
 
 @app.get("/actuals/{poste_id}")
 def actuals(poste_id: int):
-    """What this counter actually recorded, hour by hour, for every day of 2025.
+    """What this counter actually recorded, hour by hour, for 2025.
 
     The counterpart to /forecast: that says what the model expects, this says
-    what the road saw, and the difference is the only honest score of the model.
+    what the road saw, and the difference is the only honest score.
 
-    Shape -- {"poste_id": 1410, "series": {"1-V": {"2025-02-15": [24 ints]}}},
-    keyed "<direction>-<vehicule>" then by date.
-
-    Sent straight off disk rather than parsed and re-serialised; the file is
-    already the response body. A counter with no 2025 days has no file, and 404
-    is the correct answer -- callers are expected to carry on without the line.
-
-    poste_id is typed int, so no caller-supplied text reaches the path.
+    Shape -- {"poste_id": 1410, "series": {"1-V": {"2025-02-15": [24 ints]}}}.
+    Sent straight off disk; the file is already the response body.
     """
     path = ACTUALS / f"{poste_id}.json"
     if not path.is_file():
@@ -122,18 +180,39 @@ def actuals(poste_id: int):
 @app.get("/forecast")
 def forecast(poste_id: int = Query(...), direction: int = Query(..., ge=1, le=2),
              vehicule: str = Query(..., pattern="^[VC]$"), date: str = Query(...)):
+    """Hourly forecast for one series on one date.
+
+    Refuses a series outside the manifest rather than returning a forecast the
+    UI cannot score -- the caller gets a reason, not an empty chart.
+    """
+    key = (poste_id, direction, vehicule)
+    if key not in SERVED:
+        raise HTTPException(status_code=404, detail=(
+            f"counter ({poste_id}, {direction}, '{vehicule}') is not served. "
+            f"Only series present in BOTH the 2024 model and 2025 recorded data "
+            f"are available -- see /manifest for what is excluded and why."))
+
     try:
-        out = forecast_dates(poste_id, direction, vehicule, date, bundle=B)
+        out = predict.forecast_dates(poste_id, direction, vehicule, date,
+                                     bundle=BUNDLE, quiet=True)
     except ValueError as ex:
+        # Raised by the calendar-coverage guard or an unknown series. Both are
+        # deliberate refusals, and the message explains which.
         raise HTTPException(status_code=404, detail=str(ex))
-    hol = bool(out["is_holiday"].any())
-    return {"counter": {"poste_id": poste_id, "direction": direction,
-                        "vehicule": vehicule},
-            "date": date,
-            "hourly": [{"hour": int(t.hour), "predicted": float(p),
-                        "typical_2024": float(n)}
-                       for t, p, n in zip(out["TIME_STAMP"], out["PREDICTED"],
-                                          out["normal_for_slot"])],
-            "daily_total": round(float(out["PREDICTED"].sum())),
-            "is_holiday_period": hol,
-            "expected_error": B["expected_mae_holiday"] if hol else B["expected_mae"]}
+
+    holiday = bool((out["is_public_holiday"] | out["is_school_holiday"]).any())
+    return {
+        "counter": {"poste_id": poste_id, "direction": direction,
+                    "vehicule": vehicule},
+        "date": date,
+        "hourly": [{"hour": int(t.hour), "predicted": float(p),
+                    "typical_2024": float(n)}
+                   for t, p, n in zip(out["TIME_STAMP"], out["PREDICTED"],
+                                      out["typical_for_slot"])],
+        "daily_total": round(float(out["PREDICTED"].sum())),
+        "is_holiday_period": holiday,
+        # One honest figure, from the full unseen year. The old API returned a
+        # separate inflated number for holiday dates, taken from a different
+        # model variant.
+        "expected_error": EXPECTED_MAE,
+    }

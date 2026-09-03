@@ -49,21 +49,37 @@ dmypy.json
 profile_default/
 ipython_config.py
 
-# Trained model artifacts (regenerate with scripts/export_model.py)
+# Trained model artifacts.
 models/*.pkl
 models/*.joblib
 models/*.txt
 models/*.onnx
 models/*.h5
 !models/.gitkeep
+# ...EXCEPT the shipped bundle. Render builds the image from this repo, so the
+# model has to be IN it -- there is no artifact store to pull from. ~28 MB, well
+# under GitHub's 100 MB limit, but note every retrain adds another copy to
+# history permanently. If that becomes a problem, move to Git LFS or fetch it
+# from a release asset at build time.
+!models/forecast_model.pkl
 
-# Data
-data/
+# Data -- raw CSVs are build-time only and must never be committed.
+#
+# NOTE `data/*`, not `data/`. Excluding the DIRECTORY stops git descending into
+# it at all, so no `!data/external/...` negation below can ever fire. Excluding
+# its CONTENTS leaves the directory walkable and the negation works.
+data/*
 *.csv
 *.parquet
 *.feather
 *.db
 *.sqlite3
+# ...EXCEPT data/external/, which is NOT source data. It is the holiday
+# calendar and site metadata, read at CALL TIME by forecast.calendar_lux, so
+# the container cannot start without it. Both negations are needed: git will
+# not descend into an excluded directory to find the files inside it.
+!data/external/
+!data/external/*.json
 
 # Logs
 *.log

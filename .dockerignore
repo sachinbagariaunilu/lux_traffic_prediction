@@ -2,7 +2,12 @@ __pycache__/
 *.pyc
 .venv/
 .git/
+# The raw CSVs are build-time only -- the container reads the .pkl, never them.
 data/
+# ...but data/external/ is NOT source data. It is the holiday calendar and site
+# metadata, read at CALL TIME by forecast.calendar_lux, so the container cannot
+# start without it. Negation must follow the exclusion above.
+!data/external/
 *.ipynb
 notebooks/
 

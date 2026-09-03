@@ -1,0 +1,112 @@
+{
+  "_meta": {
+    "description": "Luxembourg legal public holidays (jours fériés légaux). 11 per year nominally: 8 fixed dates plus 3 derived from Easter. Some years yield fewer UNIQUE dates because two holidays collide.",
+    "legal_basis": "Loi du 25 avril 2019 modifiant le Code du travail. Eleven statutory holidays.",
+    "compiled": "2026-08-27",
+    "computable": true,
+    "computable_note": "Unlike school holidays, these CAN be generated in code: 8 fixed calendar dates plus Easter Monday (+1), Ascension (+39) and Whit Monday (+50) from Easter Sunday, which comes from the anonymous Gregorian computus. The dates below are the verification fixtures for that generator, not a list to be read at runtime.",
+    "verification": "The generated dates for 2026, 2027 and 2028 were checked against the ITM (Inspection du Travail et des Mines) published table and matched exactly, including the 2027 case where Ascension (6 May) falls BEFORE Europe Day (9 May) - so nothing may assume Easter-derived dates sort after the fixed May dates.",
+    "sources": {
+      "itm": "https://itm.public.lu/fr/conditions-travail/conges/jours-feries.html",
+      "luxembourg_portal": "https://luxembourg.public.lu/fr/vivre/qualite-de-vie/jours-feries-legaux.html",
+      "open_data": "https://data.public.lu/en/datasets/jours-feries-legaux-au-luxembourg/",
+      "menje_school_calendar": "https://men.public.lu/fr/vacances-scolaires.html — the school-calendar regulation also lists public holidays and is what confirms the 2024 Europe Day / Ascension collision verbatim: 'jour férié légal de la Journée de l'Europe / jour de congé pour l'Ascension : jeudi 9 mai 2024'"
+    }
+  },
+
+  "rules": {
+    "fixed": [
+      {"month": 1,  "day": 1,  "name": "Nouvel An"},
+      {"month": 5,  "day": 1,  "name": "Premier Mai"},
+      {"month": 5,  "day": 9,  "name": "Journée de l'Europe"},
+      {"month": 6,  "day": 23, "name": "Anniversaire du Grand-Duc"},
+      {"month": 8,  "day": 15, "name": "Assomption"},
+      {"month": 11, "day": 1,  "name": "Toussaint"},
+      {"month": 12, "day": 25, "name": "Premier jour de Noël"},
+      {"month": 12, "day": 26, "name": "Deuxième jour de Noël"}
+    ],
+    "easter_offsets": [
+      {"offset_days": 1,  "name": "Lundi de Pâques"},
+      {"offset_days": 39, "name": "Ascension"},
+      {"offset_days": 50, "name": "Lundi de Pentecôte"}
+    ],
+    "dedupe": "REQUIRED. Collisions occur (see 2024). The generator must return a de-duplicated set, because a duplicate silently corrupts DAYS_TO_HOLIDAY."
+  },
+
+  "years": {
+    "2023": {
+      "easter_sunday": "2023-04-09",
+      "unique_count": 11,
+      "dates": [
+        "2023-01-01", "2023-04-10", "2023-05-01", "2023-05-09", "2023-05-18",
+        "2023-05-29", "2023-06-23", "2023-08-15", "2023-11-01", "2023-12-25",
+        "2023-12-26"
+      ]
+    },
+    "2024": {
+      "easter_sunday": "2024-03-31",
+      "unique_count": 10,
+      "collision": "Ascension (Easter +39 = 9 May) falls exactly on Journée de l'Europe (9 May). 11 nominal holidays yield only 10 UNIQUE dates. Any generator returning 11 for 2024 has a duplicate bug.",
+      "dates": [
+        "2024-01-01", "2024-04-01", "2024-05-01", "2024-05-09", "2024-05-20",
+        "2024-06-23", "2024-08-15", "2024-11-01", "2024-12-25", "2024-12-26"
+      ]
+    },
+    "2025": {
+      "easter_sunday": "2025-04-20",
+      "unique_count": 11,
+      "dates": [
+        "2025-01-01", "2025-04-21", "2025-05-01", "2025-05-09", "2025-05-29",
+        "2025-06-09", "2025-06-23", "2025-08-15", "2025-11-01", "2025-12-25",
+        "2025-12-26"
+      ]
+    },
+    "2026": {
+      "easter_sunday": "2026-04-05",
+      "unique_count": 11,
+      "verified_against": "itm",
+      "dates": [
+        "2026-01-01", "2026-04-06", "2026-05-01", "2026-05-09", "2026-05-14",
+        "2026-05-25", "2026-06-23", "2026-08-15", "2026-11-01", "2026-12-25",
+        "2026-12-26"
+      ]
+    },
+    "2027": {
+      "easter_sunday": "2027-03-28",
+      "unique_count": 11,
+      "verified_against": "itm",
+      "note": "Ascension (6 May) falls BEFORE Journée de l'Europe (9 May) this year. Do not assume Easter-derived dates come after the fixed May dates.",
+      "dates": [
+        "2027-01-01", "2027-03-29", "2027-05-01", "2027-05-06", "2027-05-09",
+        "2027-05-17", "2027-06-23", "2027-08-15", "2027-11-01", "2027-12-25",
+        "2027-12-26"
+      ]
+    },
+    "2028": {
+      "easter_sunday": "2028-04-16",
+      "unique_count": 11,
+      "verified_against": "itm",
+      "dates": [
+        "2028-01-01", "2028-04-17", "2028-05-01", "2028-05-09", "2028-05-25",
+        "2028-06-05", "2028-06-23", "2028-08-15", "2028-11-01", "2028-12-25",
+        "2028-12-26"
+      ]
+    },
+    "2029": {
+      "easter_sunday": "2029-04-01",
+      "unique_count": 11,
+      "dates": [
+        "2029-01-01", "2029-04-02", "2029-05-01", "2029-05-09", "2029-05-10",
+        "2029-05-21", "2029-06-23", "2029-08-15", "2029-11-01", "2029-12-25",
+        "2029-12-26"
+      ]
+    }
+  },
+
+  "legacy_bundle_dates": {
+    "_why": "What forecast_model_2024.pkl actually ships: 21 dates covering 2024 and 2025 only, ending 2025-12-26. This is the dead calendar of IMPROVEMENTS.md Section 3. Kept as a fixture so a round-trip test can prove the generator reproduces it exactly before the calendar is extended.",
+    "count": 21,
+    "range": ["2024-01-01", "2025-12-26"],
+    "note": "Equals years.2024.dates (10) + years.2025.dates (11)."
+  }
+}
