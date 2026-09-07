@@ -56,12 +56,18 @@ models/*.txt
 models/*.onnx
 models/*.h5
 !models/.gitkeep
-# ...EXCEPT the shipped bundle. Render builds the image from this repo, so the
-# model has to be IN it -- there is no artifact store to pull from. ~28 MB, well
-# under GitHub's 100 MB limit, but note every retrain adds another copy to
-# history permanently. If that becomes a problem, move to Git LFS or fetch it
-# from a release asset at build time.
-!models/forecast_model.pkl
+# ...EXCEPT the two shipped bundles. Render builds the image from this repo, so
+# the models have to be IN it -- there is no artifact store to pull from.
+#
+# ~29 MB each, 58 MB together. Both are needed: the API serves the 2024 model
+# for scored 2025 comparisons and the 2024+2025 model for 2026 forecasts, and
+# loads both at import. Well under GitHub's 100 MB per-file limit, but note that
+# every retrain adds another copy to history PERMANENTLY -- at two bundles that
+# is now 58 MB per retrain. If it becomes a problem, move to Git LFS or fetch
+# them from a release asset at build time.
+!models/forecast_model_2024.pkl
+!models/forecast_model_2024_2025.pkl
+
 
 # Data -- raw CSVs are build-time only and must never be committed.
 #
