@@ -5,15 +5,22 @@ services:
     plan: free
     region: frankfurt
     healthCheckPath: /health
-    # No MODEL_PATH. app/main.py loads models/forecast_model.pkl through
-    # forecast.predict.load_bundle(); the old value pointed at
-    # forecast_model_2024.pkl, which no longer exists and would have crashed
-    # the service on boot.
+    # No MODEL_PATH. app/main.py loads BOTH bundles at import by fixed name, so
+    # a single path variable could not express it. Renaming a bundle without
+    # editing MODEL_FILES in app/main.py crashes the service on boot -- which is
+    # what an earlier MODEL_PATH pointing at a deleted file did.
     #
     # Everything the container needs is committed and COPYed by the Dockerfile:
-    #   models/forecast_model.pkl   the 14-feature bundle
+    #   models/forecast_model_2024.pkl       validation model. Trained on 2024
+    #                               only, so its 2025 forecasts can be scored
+    #                               against actuals/.
+    #   models/forecast_model_2024_2025.pkl  forecasting model. Trained on both
+    #                               years; answers 2026 onward. /forecast
+    #                               REFUSES it for dates up to 2025-12-31,
+    #                               because it trained on them.
     #   forecast/                   the prediction code -- the bundle pickles a
     #                               Profiles dataclass, so joblib.load() needs it
     #   data/external/*.json        holiday calendar, read at call time
-    #   counter_manifest.json       which counters may be served
+    #   counter_manifest_*.json     one per model: what it serves, and which
+    #                               series have 2025 actuals to score against
     #   actuals/                    recorded 2025 counts

@@ -1,6 +1,23 @@
 """Luxembourg traffic forecast API.
 
-Serves a 2024-trained model so a UI can score it against 2025 recorded counts.
+Serves TWO models, chosen with ?model= on /counters, /manifest and /forecast:
+
+    model=2024        trained on 2024 only. It has never seen 2025, so a 2025
+                      forecast can be scored against actuals/ -- this is the
+                      VALIDATION product, the one that proves the method works.
+    model=2024_2025   trained on both years. More accurate on 2026 (13.3% vs
+                      14.4% average error, measured against roadside sensors),
+                      but it trained on 2025 and so cannot be honestly scored
+                      on any date up to 2025-12-31. FORECASTING product.
+
+That asymmetry is enforced, not documented: /forecast REFUSES a date inside a
+model's own training range and says why. Otherwise the 2024_2025 model could be
+plotted against 2025 actuals and would look excellent for the wrong reason.
+
+Every series a model knows is served. A series without 2025 actuals is still
+forecastable -- the manifest flags it `scoreable_2025: false` so the UI can say
+"no recorded data to compare" instead of hiding the counter, which reads as a
+bug rather than a data boundary.
 
 ARCHITECTURE -- three files, one source of truth each:
 
@@ -11,7 +28,10 @@ ARCHITECTURE -- three files, one source of truth each:
     data/external/*.json the calendar, read at CALL TIME. Extending the holiday
                          file to 2030 needs no retraining and no redeploy of
                          the .pkl.
-    counter_manifest.json  which counters may be served (see below).
+    counter_manifest_<model>.json
+                         which series each model serves, and which of them have
+                         2025 actuals to be scored against. Derived from the
+                         bundles -- rebuild it whenever a model changes.
 
 The previous version reimplemented feature construction in app/forecast.py --
 75 lines duplicating forecast/predict.py. It silently built only 12 of the
@@ -46,16 +66,69 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"],
 # uvicorn compresses nothing of its own.
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# Loaded ONCE at import. Correct for a server; never load per request.
-BUNDLE = predict.load_bundle(ROOT / "models" / "forecast_model.pkl")
+# Loaded ONCE at import, both of them. ~29 MB each; correct for a server, and
+# never load per request.
+MODEL_FILES = {"2024": "forecast_model_2024.pkl",
+               "2024_2025": "forecast_model_2024_2025.pkl"}
+BUNDLES = {k: predict.load_bundle(ROOT / "models" / f)
+           for k, f in MODEL_FILES.items()}
+DEFAULT_MODEL = "2024"
+# Kept so the existing single-model responses keep working unchanged.
+BUNDLE = BUNDLES[DEFAULT_MODEL]
 
-# Which counters may be served. Built by scripts/build_counter_manifest.py as
-# the INTERSECTION of the 2024 model and the 2025 actuals -- a series missing
-# from either side produces a panel with half the answer, which reads as a
-# broken chart rather than a data boundary. COUNTER_MANIFEST.md records every
-# exclusion and its reason.
-MANIFEST = json.loads((ROOT / "counter_manifest.json").read_text())
-SERVED = {(c["poste_id"], c["direction"], c["vehicule"]) for c in MANIFEST["included"]}
+# What each model serves. Built by scripts/build_counter_manifest.py as EVERY
+# series the model knows, with a per-series scoreable_2025 flag rather than the
+# old intersection rule -- that rule would have left the 2024+2025 model serving
+# nothing, since no year holds both its forecast and a recorded count.
+# COUNTER_MANIFEST.md records the counts and every exclusion with its reason.
+MANIFESTS = {k: json.loads((ROOT / f"counter_manifest_{k}.json").read_text())
+             for k in MODEL_FILES}
+SERVED = {k: {(c["poste_id"], c["direction"], c["vehicule"]) for c in m["served"]}
+          for k, m in MANIFESTS.items()}
+# Which series have 2025 actuals, so /forecast can tell the UI up front whether
+# the panel it is about to draw will have a second line.
+SCOREABLE = {k: {(c["poste_id"], c["direction"], c["vehicule"])
+                 for c in m["served"] if c["scoreable_2025"]}
+             for k, m in MANIFESTS.items()}
+MANIFEST = MANIFESTS[DEFAULT_MODEL]
+
+
+def _pick(model: str) -> str:
+    """Validate the ?model= parameter, listing the choices on a bad one."""
+    if model not in MODEL_FILES:
+        raise HTTPException(status_code=400, detail=(
+            f"unknown model {model!r}. Choose one of: "
+            f"{', '.join(sorted(MODEL_FILES))}"))
+    return model
+
+
+def _trained_range(model: str) -> tuple[str, str]:
+    """First and last date the model fitted on, as YYYY-MM-DD."""
+    b = BUNDLES[model]
+    built = str(b["profiles_built_from"])            # "2024-01-01..2025-12-31"
+    start = built.split("..")[0]
+    return start, str(b["trained_through"])[:10]
+
+
+def _refuse_if_trained_on(model: str, date: str) -> None:
+    """Refuse a forecast for a date the model was fitted on.
+
+    A model scored on its own training data reports an accuracy it does not
+    have. The training repo guards this with assert_no_leakage() and
+    confirm_holdout_spend; this is the same rule at the API boundary, where a
+    UI could otherwise plot model=2024_2025 against 2025 actuals and publish a
+    flattering number nobody could reproduce.
+    """
+    start, end = _trained_range(model)
+    if start <= date <= end:
+        other = next((k for k in MODEL_FILES
+                      if not _trained_range(k)[0] <= date <= _trained_range(k)[1]),
+                     None)
+        raise HTTPException(status_code=409, detail=(
+            f"model {model!r} trained on {start}..{end}, so {date} is inside its "
+            f"own training data -- a forecast there would be memory, not "
+            f"prediction, and scoring it would overstate the model."
+            + (f" Use model={other!r} for this date." if other else "")))
 
 # Recorded 2025 counts, one file per counter. Read from disk per request rather
 # than held in memory: ~30 MB most callers never ask for.
@@ -72,10 +145,14 @@ EXPECTED_MAE = next((s["MAE"] for s in _HOLDOUT if s["Model"].startswith("model"
 ENDPOINTS = [
     {"path": "/health", "method": "GET",
      "description": "service status, model accuracy, and coverage bounds"},
+    {"path": "/models", "method": "GET",
+     "description": "the two models, what each is for, and which dates each may forecast"},
     {"path": "/counters", "method": "GET",
-     "description": "counters the UI may show -- present in BOTH 2024 and 2025"},
+     "description": "every series the model can forecast, flagged for whether 2025 actuals exist",
+     "optional_params": {"model": "2024 (default) or 2024_2025"}},
     {"path": "/manifest", "method": "GET",
-     "description": "what is served and what is excluded, with reasons"},
+     "description": "what is served, what cannot be scored, and why",
+     "optional_params": {"model": "2024 (default) or 2024_2025"}},
     {"path": "/forecast", "method": "GET",
      "description": "hourly forecast for one counter on one date",
      "required_params": {
@@ -83,6 +160,7 @@ ENDPOINTS = [
          "direction": "1 or 2",
          "vehicule": "V for cars, C for trucks",
          "date": "YYYY-MM-DD"},
+     "optional_params": {"model": "2024 (default) or 2024_2025"},
      "example": "/forecast?poste_id=1410&direction=1&vehicule=V&date=2025-03-12"},
     {"path": "/actuals/{poste_id}", "method": "GET",
      "description": "what the counter actually recorded, hour by hour, 2025 only",
@@ -93,9 +171,47 @@ ENDPOINTS = [
 
 @app.get("/")
 def root():
-    return {"service": "Luxembourg Traffic Forecast", "version": "2.0",
-            "trained_through": BUNDLE["trained_through"],
+    return {"service": "Luxembourg Traffic Forecast", "version": "3.0",
+            "models": {k: {"trained_through": str(BUNDLES[k]["trained_through"])[:10],
+                           "role": MANIFESTS[k]["role"]} for k in MODEL_FILES},
+            "default_model": DEFAULT_MODEL,
             "endpoints": ENDPOINTS}
+
+
+@app.get("/models")
+def models():
+    """The two models, and the dates each one may honestly forecast.
+
+    `forecastable_from` is the day after a model's training data ends. Asking
+    for anything earlier gets a 409 from /forecast, because that date is inside
+    the model's own training set.
+    """
+    import datetime as _dt
+    out = []
+    for k in MODEL_FILES:
+        b, m = BUNDLES[k], MANIFESTS[k]
+        start, end = _trained_range(k)
+        nxt = (_dt.date.fromisoformat(end) + _dt.timedelta(days=1)).isoformat()
+        out.append({
+            "model": k,
+            "role": m["role"],
+            "trained_on": f"{start}..{end}",
+            "forecastable_from": nxt,
+            "calendar_through": str(b["calendar_through"].date()),
+            "series_served": m["counts"]["served"],
+            "scoreable_2025": m["counts"]["scoreable_2025"],
+            "scoreable_years": m["scoreable_years"],
+            "blind_test_mae": next(
+                (sc["MAE"] for sc in b["scores"] if sc["Model"].startswith("model")),
+                None),
+            "blind_test_window": ("Nov-Dec 2024" if k == "2024" else "Nov-Dec 2025"),
+        })
+    return {"default": DEFAULT_MODEL, "models": out,
+            "note": ("blind_test_mae is each model's own 46-day measurement and the "
+                     "windows DIFFER, so the two numbers are not comparable. On the "
+                     "one test both models face identically -- June-July 2026 "
+                     "roadside sensors -- 2024_2025 scores 13.3% average error "
+                     "against 14.4% for 2024.")}
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -122,7 +238,10 @@ def health():
         # Full unseen year, NOT the 46-day window. See EXPECTED_MAE above.
         "expected_mae": EXPECTED_MAE,
         "accuracy_basis": "full unseen year 2025",
-        "series_served": len(SERVED),
+        "series_served": len(SERVED[DEFAULT_MODEL]),
+        "models": {k: {"trained_through": str(BUNDLES[k]["trained_through"])[:10],
+                       "series_served": MANIFESTS[k]["counts"]["served"]}
+                   for k in MODEL_FILES},
         # The UI must not offer dates past this -- beyond it the three calendar
         # features would flatten to constants and every Tuesday would return an
         # identical total, January the same as August.
@@ -133,31 +252,46 @@ def health():
 
 
 @app.get("/counters")
-def counters():
-    """Counters the UI may show: present in BOTH the 2024 model and 2025 actuals.
+def counters(model: str = Query(DEFAULT_MODEL)):
+    """Every series this model can forecast, busiest first.
 
-    Sorted busiest first. `avg_per_hour` covers the hours the counter actually
-    reported in 2024, not the full year -- no counter reported all 366 days.
+    `scoreable_2025` is the field the UI needs: false means the series recorded
+    no 2025 hours, so a 2025 forecast will have no actual line to sit beside.
+    The counter is still listed and still forecastable -- omitting it would look
+    like a missing counter rather than missing ground truth.
+
+    `avg_per_hour` covers the hours the counter actually reported, not the
+    calendar year -- no counter reported every day.
     """
+    model = _pick(model)
+    m = MANIFESTS[model]
     out = []
-    for c in MANIFEST["included"]:
+    for c in m["served"]:
         veh = "cars" if c["vehicule"] == "V" else "trucks"
         out.append({**c,
                     "label": f"{c['route']} — {c['localite']} "
                              f"(dir {c['direction']}, {veh})"})
-    return {"count": len(out), "counters": out}
+    return {"model": model, "count": len(out),
+            "scoreable_2025": m["counts"]["scoreable_2025"],
+            "not_scoreable_2025": m["counts"]["not_scoreable_2025"],
+            "counters": out}
 
 
 @app.get("/manifest")
-def manifest():
-    """What is served and what is held back, with the reason for each.
+def manifest(model: str = Query(DEFAULT_MODEL)):
+    """What is served, what cannot be scored, and why.
 
-    Exposed so the UI can state its own coverage instead of implying the
-    network is smaller than it is.
+    Exposed so the UI can state its own coverage instead of implying the network
+    is smaller than it is.
     """
-    return {"rule": MANIFEST["rule"], "counts": MANIFEST["counts"],
-            "excluded_model_only": MANIFEST["excluded_model_only"],
-            "excluded_actuals_only": MANIFEST["excluded_actuals_only"]}
+    model = _pick(model)
+    m = MANIFESTS[model]
+    return {"model": model, "role": m["role"], "rule": m["rule"],
+            "trained_through": m["trained_through"],
+            "scoreable_years": m["scoreable_years"],
+            "counts": m["counts"],
+            "not_scoreable_2025": m["not_scoreable_2025"],
+            "excluded_actuals_only": m["excluded_actuals_only"]}
 
 
 @app.get("/actuals/{poste_id}")
@@ -179,32 +313,58 @@ def actuals(poste_id: int):
 
 @app.get("/forecast")
 def forecast(poste_id: int = Query(...), direction: int = Query(..., ge=1, le=2),
-             vehicule: str = Query(..., pattern="^[VC]$"), date: str = Query(...)):
-    """Hourly forecast for one series on one date.
+             vehicule: str = Query(..., pattern="^[VC]$"), date: str = Query(...),
+             model: str = Query(DEFAULT_MODEL)):
+    """Hourly forecast for one series on one date, from the chosen model.
 
-    Refuses a series outside the manifest rather than returning a forecast the
-    UI cannot score -- the caller gets a reason, not an empty chart.
+    Two refusals, both deliberate:
+
+      404  the model has no history for this series, so there is no profile and
+           forecast_dates() would have to invent a level.
+      409  the date is inside the model's own training range. That is not a
+           forecast, and scoring it would overstate the model. The message
+           names the other model, which can answer honestly.
+
+    `scoreable` in the response says whether actuals/ has 2025 data for this
+    series. False is not an error: the forecast is real, there is simply nothing
+    recorded to plot against it.
     """
+    model = _pick(model)
+    _refuse_if_trained_on(model, date)
     key = (poste_id, direction, vehicule)
-    if key not in SERVED:
+    if key not in SERVED[model]:
+        served_by = [k for k in MODEL_FILES if key in SERVED[k]]
         raise HTTPException(status_code=404, detail=(
-            f"counter ({poste_id}, {direction}, '{vehicule}') is not served. "
-            f"Only series present in BOTH the 2024 model and 2025 recorded data "
-            f"are available -- see /manifest for what is excluded and why."))
+            f"counter ({poste_id}, {direction}, '{vehicule}') is not in model "
+            f"{model!r} -- it has no history there, so the model refuses to "
+            f"guess a level."
+            + (f" Served by model={served_by[0]!r}." if served_by else
+               " See /manifest for what is available.")))
 
     try:
         out = predict.forecast_dates(poste_id, direction, vehicule, date,
-                                     bundle=BUNDLE, quiet=True)
+                                     bundle=BUNDLES[model], quiet=True)
     except ValueError as ex:
         # Raised by the calendar-coverage guard or an unknown series. Both are
         # deliberate refusals, and the message explains which.
         raise HTTPException(status_code=404, detail=str(ex))
 
     holiday = bool((out["is_public_holiday"] | out["is_school_holiday"]).any())
+    scoreable = key in SCOREABLE[model] and date.startswith("2025")
     return {
         "counter": {"poste_id": poste_id, "direction": direction,
                     "vehicule": vehicule},
+        "model": model,
         "date": date,
+        # Whether /actuals/{poste_id} can supply a recorded line for this date.
+        # The UI shows the forecast either way and says so when it cannot score.
+        "scoreable": scoreable,
+        "scoreable_note": (
+            None if scoreable else
+            "no recorded 2025 data for this series -- the forecast stands, but "
+            "there is nothing measured to compare it against"
+            if key not in SCOREABLE[model] else
+            "actuals/ covers 2025 only, so this date cannot be scored"),
         "hourly": [{"hour": int(t.hour), "predicted": float(p),
                     "typical_2024": float(n)}
                    for t, p, n in zip(out["TIME_STAMP"], out["PREDICTED"],
@@ -214,5 +374,11 @@ def forecast(poste_id: int = Query(...), direction: int = Query(..., ge=1, le=2)
         # One honest figure, from the full unseen year. The old API returned a
         # separate inflated number for holiday dates, taken from a different
         # model variant.
-        "expected_error": EXPECTED_MAE,
+        "expected_error": (EXPECTED_MAE if model == DEFAULT_MODEL else None),
+        "expected_error_note": (
+            None if model == DEFAULT_MODEL else
+            "no full-unseen-year figure exists for this model: it trained on "
+            "2025, so there is no year it has not seen. Measured against "
+            "June-July 2026 roadside sensors it averages 13.3% error, "
+            "against 14.4% for model=2024."),
     }

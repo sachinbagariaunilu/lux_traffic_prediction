@@ -26,10 +26,12 @@ COPY models/ ./models/
 # Without this every date fails the coverage guard.
 COPY data/external/ ./data/external/
 
-# Which counters may be served: the intersection of the 2024 model and the 2025
-# actuals. Derived from both, so it is regenerated on deploy, not written by
-# hand. See COUNTER_MANIFEST.md for what is excluded and why.
-COPY counter_manifest.json ./
+# Which series each model serves, and which of them have 2025 actuals to be
+# scored against. Derived from the bundles, so regenerated on deploy rather than
+# written by hand. See COUNTER_MANIFEST.md for the counts and the exclusions.
+# One manifest per model. Both are required: app/main.py loads them at import
+# and cannot start with either missing.
+COPY counter_manifest_2024.json counter_manifest_2024_2025.json ./
 
 # Recorded 2025 counts served by /actuals/{poste_id}. ~30 MB, and the image is
 # the only place the API looks for them.

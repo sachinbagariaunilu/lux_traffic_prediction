@@ -1,25 +1,35 @@
-"""Decide which counters the UI may show, and record why for the rest.
+"""Build one manifest per model: every series it can forecast, flagged for
+whether that forecast can be SCORED.
 
     python scripts/build_counter_manifest.py
 
-THE RULE. The UI compares a 2024-trained forecast against 2025 recorded counts.
-A series is only useful there if BOTH sides exist:
+THE RULE CHANGED on 2026-09-07, and the change matters.
 
-    in the model   -> it has a 2024 profile, so it can be forecast
-    in actuals     -> it recorded 2025 hours, so the forecast can be SCORED
+The old rule kept the INTERSECTION of the model and the 2025 actuals, on the
+argument that a series without actuals produces "a panel with half the answer".
+That was right while there was one model and one comparison. It is wrong now,
+because there are two products:
 
-A series present in only one side is not a bug, it is a counter that was
-installed, retired, or reconfigured between the two years. Showing it produces a
-panel with half the answer missing, which reads as a broken chart rather than as
-a data boundary. So the manifest keeps the INTERSECTION and writes every
-exclusion down with its reason.
+    2024 model        forecasts 2025, and 2025 actuals exist -> SCOREABLE
+    2024+2025 model   forecasts 2026 onward, no actuals exist -> forecast only
 
-Writes:
-    counter_manifest.json   what the API serves -- the included series
-    COUNTER_MANIFEST.md     the human-readable log: counts, reasons, the lists
+Under the intersection rule the second product would serve nothing at all: it
+has no year with both a forecast and a recorded count. So the manifest now
+serves EVERY series the model knows and carries a per-series flag:
 
-Re-run whenever the model or actuals/ change. Both outputs are committed, so a
-change in what the UI shows is visible in a diff rather than discovered.
+    scoreable_2025   the series also recorded 2025 hours, so a forecast for a
+                     2025 date can be plotted against what the road saw.
+
+The UI lists all of them and says so when the comparison is unavailable, rather
+than the counter silently not existing. A missing actual is a data boundary; a
+missing counter looks like a bug.
+
+Writes, per model:
+    counter_manifest_<model>.json    what the API serves
+    COUNTER_MANIFEST.md              the human-readable log, both models
+
+Re-run whenever a model or actuals/ changes. Outputs are committed, so a change
+in what the UI offers shows up in a diff rather than being discovered.
 """
 from __future__ import annotations
 
@@ -37,29 +47,31 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import joblib  # noqa: E402  -- must follow the sys.path insert
-MODEL = ROOT / "models" / "forecast_model.pkl"
+
+# The two products. Keys are the `model` parameter the API accepts.
+MODELS = {
+    "2024": {
+        "file": "forecast_model_2024.pkl",
+        "role": "validation -- forecasts a year it never saw, so it can be scored",
+        "scoreable_years": [2025],
+    },
+    "2024_2025": {
+        "file": "forecast_model_2024_2025.pkl",
+        "role": "forecasting -- most recent data, no scoreable year available",
+        "scoreable_years": [],
+    },
+}
 ACTUALS = ROOT / "actuals"
-OUT_JSON = ROOT / "counter_manifest.json"
 OUT_MD = ROOT / "COUNTER_MANIFEST.md"
 
-# A series with only a handful of recorded days can be shown, but almost every
-# date the user picks will have no actual line. Flagged, not excluded -- the UI
-# already explains a missing day, and dropping a real counter hides coverage.
+# A series with only a handful of recorded days can still be shown, but almost
+# every date the user picks will have no actual line. Flagged, not excluded.
 THIN_DAYS = 30
 
 
-def main() -> None:
-    bundle = joblib.load(MODEL)
-    prof = bundle["profiles"]
-    model_series = {
-        (int(r.POSTE_ID), int(r.DIRECTION), str(r.VEHICULE))
-        for r in prof.provenance.itertuples()
-    }
-
-    # actuals/<poste>.json -> {"series": {"<dir>-<veh>": {"YYYY-MM-DD": [...]}}}
-    # index.json is a plain list of ids, not a counter file -- skip it rather
-    # than special-casing the shape, so a future sidecar file cannot break this.
-    actual_series: dict[tuple[int, int, str], int] = {}
+def read_actuals() -> dict[tuple[int, int, str], int]:
+    """(poste, direction, vehicule) -> number of recorded 2025 days."""
+    out: dict[tuple[int, int, str], int] = {}
     for path in sorted(ACTUALS.glob("*.json")):
         if path.stem == "index":
             continue
@@ -70,22 +82,34 @@ def main() -> None:
         pid = int(payload["poste_id"])
         for key, days in payload.get("series", {}).items():
             direction, vehicule = key.split("-", 1)
-            actual_series[(pid, int(direction), vehicule)] = len(days)
+            out[(pid, int(direction), vehicule)] = len(days)
+    return out
 
-    both = sorted(model_series & set(actual_series))
-    model_only = sorted(model_series - set(actual_series))
-    actual_only = sorted(set(actual_series) - model_series)
+
+def series_of(spec: dict) -> set:
+    """The (poste, direction, vehicule) keys one bundle can forecast."""
+    prof = joblib.load(ROOT / "models" / spec["file"])["profiles"]
+    return {(int(r.POSTE_ID), int(r.DIRECTION), str(r.VEHICULE))
+            for r in prof.provenance.itertuples()}
+
+
+def build(model_key: str, spec: dict, actual_series: dict,
+          all_model_series: dict) -> dict:
+    bundle = joblib.load(ROOT / "models" / spec["file"])
+    prof = bundle["profiles"]
+    model_series = {
+        (int(r.POSTE_ID), int(r.DIRECTION), str(r.VEHICULE))
+        for r in prof.provenance.itertuples()
+    }
 
     # Route / locality / coordinates. NOT in the bundle -- it carries only what
-    # the model reads, and the model never sees them (see FINDINGS: ROAD_CLASS
-    # measured -0.02). They are exported alongside so the API can label a
-    # counter without the training repo present.
+    # the model reads, and the model never sees them. Exported alongside so the
+    # API can label a counter without the training repo present.
     attrs = {
         (int(a["poste_id"]), int(a["direction"]), str(a["vehicule"])): a
         for a in json.loads((ROOT / "data" / "external" / "series_attrs.json")
                             .read_text())
     }
-
     prov = {
         (int(r.POSTE_ID), int(r.DIRECTION), str(r.VEHICULE)): r
         for r in prof.provenance.itertuples()
@@ -95,11 +119,12 @@ def main() -> None:
         p, d, v = key
         a = attrs.get(key, {})
         pr = prov.get(key)
-        # Mean over the hours the counter actually reported in 2024, not over
-        # the calendar year -- no counter reported all 366 days.
+        # Mean over the hours the counter actually reported, not the calendar
+        # year -- no counter reported every day.
         avg = float(prof.series.loc[
             (prof.series.POSTE_ID == p) & (prof.series.DIRECTION == d)
             & (prof.series.VEHICULE == v), "PROF_MEAN"].iloc[0])
+        recorded = actual_series.get(key)
         return {
             "poste_id": p, "direction": d, "vehicule": v,
             "route": a.get("route"), "localite": a.get("localite"),
@@ -108,129 +133,152 @@ def main() -> None:
             # NOT lat/lon -- reproject before putting on a map.
             "coord_x": a.get("coord_x"), "coord_y": a.get("coord_y"),
             "avg_per_hour": round(avg, 1),
-            # Field names kept as the UI already reads them. days_reported /
-            # first_day / last_day describe 2024 (the training year); the 2025
-            # figure is additive so nothing downstream breaks.
             "days_reported": int(pr.N_OBS // 24) if pr is not None else None,
             "first_day": str(pr.FIRST_SEEN.date()) if pr is not None else None,
             "last_day": str(pr.LAST_SEEN.date()) if pr is not None else None,
-            "recorded_days_2025": actual_series[key],
-            "thin": actual_series[key] < THIN_DAYS,
+            # The flag the UI needs. None means the series recorded no 2025
+            # hours at all, so a 2025 forecast has nothing to be plotted against.
+            "recorded_days_2025": recorded,
+            "scoreable_2025": recorded is not None,
+            # Which models can forecast this series at all. The UI needs it
+            # because the model is chosen by the DATE: a series the 2024 model
+            # has never seen cannot be forecast for 2025 however much 2026 data
+            # exists for it, and the picker has to say so rather than let the
+            # request 404.
+            "served_by": sorted(k for k, ks in all_model_series.items()
+                                if key in ks),
+            "thin": recorded is not None and recorded < THIN_DAYS,
         }
 
-    included = [entry(k) for k in both]
-    included.sort(key=lambda e: e["avg_per_hour"], reverse=True)
+    served = [entry(k) for k in sorted(model_series)]
+    served.sort(key=lambda e: e["avg_per_hour"], reverse=True)
+    scoreable = [e for e in served if e["scoreable_2025"]]
+    unscoreable = [e for e in served if not e["scoreable_2025"]]
+    actuals_only = sorted(set(actual_series) - model_series)
 
-    OUT_JSON.write_text(json.dumps({
-        "rule": "series present in BOTH the 2024 model and 2025 actuals",
+    payload = {
+        "model": model_key,
+        "model_file": spec["file"],
+        "role": spec["role"],
+        "trained_through": str(bundle["trained_through"]),
+        "profiles_built_from": str(bundle["profiles_built_from"]),
+        "rule": ("every series the model can forecast; scoreable_2025 says "
+                 "whether 2025 actuals exist to compare against"),
+        "scoreable_years": spec["scoreable_years"],
         "thin_days_threshold": THIN_DAYS,
-        "counts": {"included": len(both), "model_only": len(model_only),
-                   "actuals_only": len(actual_only),
-                   "model_total": len(model_series),
-                   "actuals_total": len(actual_series)},
-        "included": included,
-        "excluded_model_only": [
-            {"poste_id": p, "direction": d, "vehicule": v,
-             "reason": "no 2025 recorded data -- forecastable but unscoreable"}
-            for p, d, v in model_only],
+        "counts": {
+            "served": len(served),
+            "scoreable_2025": len(scoreable),
+            "not_scoreable_2025": len(unscoreable),
+            "sites": len({e["poste_id"] for e in served}),
+            "actuals_only": len(actuals_only),
+        },
+        "served": served,
+        "not_scoreable_2025": [
+            {"poste_id": e["poste_id"], "direction": e["direction"],
+             "vehicule": e["vehicule"],
+             "reason": "no 2025 recorded data -- forecastable but not scoreable"}
+            for e in unscoreable],
         "excluded_actuals_only": [
             {"poste_id": p, "direction": d, "vehicule": v,
-             "reason": "not in the 2024 training data -- the model refuses it"}
-            for p, d, v in actual_only],
-    }, indent=2), encoding="utf-8")
+             "reason": "not in this model's training data -- the model refuses it"}
+            for p, d, v in actuals_only],
+    }
+    out = ROOT / f"counter_manifest_{model_key}.json"
+    out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"  wrote {out.name}: {len(served)} served, "
+          f"{len(scoreable)} scoreable on 2025, {len(unscoreable)} not")
+    return payload
 
-    def sites(keys):
-        return sorted({p for p, _, _ in keys})
 
-    def group(keys):
-        out = defaultdict(list)
-        for p, d, v in keys:
-            out[p].append(f"{d}-{v}")
-        return out
+def main() -> None:
+    actual_series = read_actuals()
+    print(f"actuals/: {len(actual_series)} series with recorded 2025 days")
+    all_model_series = {k: series_of(spec) for k, spec in MODELS.items()}
+    for k, ks in all_model_series.items():
+        print(f"  {k}: {len(ks)} series")
+    built = {k: build(k, spec, actual_series, all_model_series)
+             for k, spec in MODELS.items()}
 
-    thin = [i for i in included if i["thin"]]
     md = [
         "# Counter manifest",
         "",
-        "Which counters the UI shows, and why the rest are held back.",
-        f"Generated by `scripts/build_counter_manifest.py` from",
-        f"`models/forecast_model.pkl` and `actuals/`.",
+        "What each model offers, and where a forecast can be scored.",
+        "Generated by `scripts/build_counter_manifest.py`.",
         "",
         "## The rule",
         "",
-        "The UI scores a **2024-trained forecast** against **2025 recorded",
-        "counts**. Both sides must exist or the panel shows half an answer:",
+        "Every series a model can forecast is **served**. A separate flag says",
+        "whether it can also be **scored**:",
         "",
-        "| Side | Gives us |",
+        "| Flag | Meaning |",
         "| --- | --- |",
-        "| 2024 model | a profile, so the series can be forecast |",
-        "| 2025 actuals | recorded hours, so the forecast can be scored |",
+        "| `scoreable_2025: true` | the series recorded 2025 hours, so a 2025 forecast can be plotted against what the road saw |",
+        "| `scoreable_2025: false` | no 2025 recorded data — the forecast still works, there is just nothing to compare it to |",
         "",
-        "Only the **intersection** is shown. Everything else is listed below with",
-        "its reason — these are counters installed, retired or reconfigured",
-        "between the two years, not data errors.",
+        "This replaced an intersection rule that served only series present in",
+        "both the model and the actuals. That rule made sense for one model and",
+        "one comparison; with two products it would have left the 2024+2025",
+        "model serving nothing, since no year has both its forecast and a",
+        "recorded count.",
         "",
-        "## Counts",
+        "## The two models",
         "",
-        "| | Series | Sites |",
-        "| --- | --- | --- |",
-        f"| **Shown (in both)** | **{len(both)}** | **{len(sites(both))}** |",
-        f"| Model only — no 2025 data | {len(model_only)} | {len(sites(model_only))} |",
-        f"| Actuals only — not in 2024 training | {len(actual_only)} | {len(sites(actual_only))} |",
-        f"| Model total | {len(model_series)} | {len(sites(model_series))} |",
-        f"| Actuals total | {len(actual_series)} | {len(sites(actual_series))} |",
-        "",
-        f"Of the {len(both)} shown, **{len(thin)}** recorded fewer than {THIN_DAYS}",
-        "days in 2025. Those are flagged `thin` rather than excluded — the UI",
-        "already explains a date with no recorded line, and dropping a real",
-        "counter would hide coverage that exists.",
-        "",
-        "## Excluded — in the model, no 2025 data",
-        "",
-        "Forecastable, but nothing to score against. Most likely retired or",
-        "offline through 2025.",
-        "",
+        "| Model | Trained through | Served | Scoreable on 2025 | Role |",
+        "| --- | --- | --- | --- | --- |",
     ]
-    if model_only:
-        md += ["| Site | Series |", "| --- | --- |"]
-        md += [f"| {p} | {', '.join(sorted(s))} |"
-               for p, s in sorted(group(model_only).items())]
-    else:
-        md.append("_None._")
-
+    for k, p in built.items():
+        md.append(f"| `{k}` | {p['trained_through'][:10]} | "
+                  f"**{p['counts']['served']}** | {p['counts']['scoreable_2025']} | "
+                  f"{p['role']} |")
     md += [
         "",
-        "## Excluded — recorded in 2025, absent from 2024 training",
-        "",
-        "The model **refuses** these: with no 2024 history there is no profile,",
-        "and `forecast_dates()` raises rather than guessing. That is correct —",
-        "a counter's traffic LEVEL cannot be inferred from its location (road",
-        "class spans 0.1 to 1,351 veh/h), so any number would be invented.",
-        "",
-        "To forecast them, retrain with 2025 included.",
+        "The 2024+2025 model knows more series because counters installed during",
+        "2025 have no 2024 history and so cannot appear in a 2024-only model.",
         "",
     ]
-    if actual_only:
-        md += ["| Site | Series |", "| --- | --- |"]
-        md += [f"| {p} | {', '.join(sorted(s))} |"
-               for p, s in sorted(group(actual_only).items())]
-    else:
-        md.append("_None._")
+    for k, p in built.items():
+        ns = p["not_scoreable_2025"]
+        md += [
+            f"## `{k}` — not scoreable on 2025 ({len(ns)} series)",
+            "",
+            "Forecastable, nothing to score against. Most are counters retired or",
+            "offline through 2025.",
+            "",
+        ]
+        if ns:
+            grouped = defaultdict(list)
+            for e in ns:
+                grouped[e["poste_id"]].append(f"{e['direction']}-{e['vehicule']}")
+            md += ["| Site | Series |", "| --- | --- |"]
+            md += [f"| {pid} | {', '.join(sorted(v))} |"
+                   for pid, v in sorted(grouped.items())]
+        else:
+            md.append("_None._")
+        md.append("")
+        ao = p["excluded_actuals_only"]
+        md += [
+            f"## `{k}` — recorded in 2025, absent from this model ({len(ao)} series)",
+            "",
+            "The model **refuses** these: with no history there is no profile, and",
+            "`forecast_dates()` raises rather than guessing. A counter's traffic",
+            "LEVEL cannot be inferred from its location, so any number would be",
+            "invented.",
+            "",
+        ]
+        if ao:
+            grouped = defaultdict(list)
+            for e in ao:
+                grouped[e["poste_id"]].append(f"{e['direction']}-{e['vehicule']}")
+            md += ["| Site | Series |", "| --- | --- |"]
+            md += [f"| {pid} | {', '.join(sorted(v))} |"
+                   for pid, v in sorted(grouped.items())]
+        else:
+            md.append("_None._")
+        md.append("")
 
-    if thin:
-        md += ["", f"## Shown but thin (< {THIN_DAYS} recorded days in 2025)", "",
-               "| Site | Series | Days |", "| --- | --- | --- |"]
-        md += [f"| {i['poste_id']} | {i['direction']}-{i['vehicule']} | "
-               f"{i['recorded_days_2025']} |" for i in
-               sorted(thin, key=lambda i: i["recorded_days_2025"])]
-
-    OUT_MD.write_text("\n".join(md) + "\n", encoding="utf-8")
-
-    print(f"included (both years) : {len(both)} series, {len(sites(both))} sites")
-    print(f"excluded, model only  : {len(model_only)} series, {len(sites(model_only))} sites")
-    print(f"excluded, actuals only: {len(actual_only)} series, {len(sites(actual_only))} sites")
-    print(f"shown but thin        : {len(thin)}")
-    print(f"\nwrote {OUT_JSON.name} and {OUT_MD.name}")
+    OUT_MD.write_text("\n".join(md), encoding="utf-8")
+    print(f"  wrote {OUT_MD.name}")
 
 
 if __name__ == "__main__":
