@@ -164,6 +164,18 @@ def build(model_key: str, spec: dict, actual_series: dict,
         "profiles_built_from": str(bundle["profiles_built_from"]),
         "rule": ("every series the model can forecast; scoreable_2025 says "
                  "whether 2025 actuals exist to compare against"),
+        # Bundle metadata the API needs for /models, /health and the
+        # trained-on-this-date guard. Recorded HERE so the API can answer all of
+        # those, and refuse a bad date, without unpickling a 29 MB bundle -- the
+        # bundles are lazily loaded and only an actual forecast should trigger
+        # one. Regenerated from the bundle on every deploy, so it cannot drift.
+        "features": len(bundle["features"]),
+        "calendar_from": str(bundle["calendar_from"].date()),
+        "calendar_through": str(bundle["calendar_through"].date()),
+        "blind_test_scores": bundle["scores"],
+        "holdout_mae": next(
+            (sc["MAE"] for sc in ((bundle.get("holdout") or {}).get("scores") or [])
+             if sc["Model"].startswith("model")), None),
         "scoreable_years": spec["scoreable_years"],
         "thin_days_threshold": THIN_DAYS,
         "counts": {

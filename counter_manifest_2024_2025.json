@@ -5,6 +5,28 @@
   "trained_through": "2025-12-31",
   "profiles_built_from": "2024-01-01..2025-12-31",
   "rule": "every series the model can forecast; scoreable_2025 says whether 2025 actuals exist to compare against",
+  "features": 14,
+  "calendar_from": "2022-09-15",
+  "calendar_through": "2029-09-16",
+  "blind_test_scores": [
+    {
+      "Model": "model (14 feats)",
+      "MAE": 15.31,
+      "RMSE": 45.26,
+      "R2": 0.9525,
+      "Within_20pct_%": 80.2,
+      "Rows": 1122288
+    },
+    {
+      "Model": "profile (do-nothing baseline)",
+      "MAE": 17.29,
+      "RMSE": 53.28,
+      "R2": 0.9342,
+      "Within_20pct_%": 78.4,
+      "Rows": 1122288
+    }
+  ],
+  "holdout_mae": null,
   "scoreable_years": [],
   "thin_days_threshold": 30,
   "counts": {

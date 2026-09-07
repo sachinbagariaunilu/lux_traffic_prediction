@@ -45,4 +45,16 @@ COPY actuals/ ./actuals/
 # anything else.
 
 EXPOSE 8000
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# --workers 1, PINNED, not left to the default.
+#
+# uvicorn's --workers defaults to $WEB_CONCURRENCY if that is set, else 1. Each
+# worker is a separate process with its own copy of everything: measured, one
+# worker holding both model bundles sits at ~411 MB resident, so two workers
+# cannot fit the 512 MB Render free plan and the platform would OOM-restart the
+# service. That failure shows up as requests vanishing and a cold start, not as
+# an error in the log.
+#
+# Raising this is only safe together with a larger plan. If you need
+# concurrency on the free plan, the models are the constraint -- not the worker
+# count.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]

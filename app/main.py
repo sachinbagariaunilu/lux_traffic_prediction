@@ -47,6 +47,7 @@ insert it (see scripts/build_counter_manifest.py).
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -66,15 +67,45 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"],
 # uvicorn compresses nothing of its own.
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# Loaded ONCE at import, both of them. ~29 MB each; correct for a server, and
-# never load per request.
 MODEL_FILES = {"2024": "forecast_model_2024.pkl",
                "2024_2025": "forecast_model_2024_2025.pkl"}
-BUNDLES = {k: predict.load_bundle(ROOT / "models" / f)
-           for k, f in MODEL_FILES.items()}
 DEFAULT_MODEL = "2024"
-# Kept so the existing single-model responses keep working unchanged.
-BUNDLE = BUNDLES[DEFAULT_MODEL]
+
+# LAZILY loaded, then cached for the life of the process. Never per request.
+#
+# Loading both at import cost 327 MB resident against Render's 512 MB free-plan
+# cap -- measured, and serving requests then peaked at 512. A bundle is 29 MB on
+# disk and ~70 MB in memory, so deferring the second one keeps the floor at
+# 259 MB and halves cold-start work, which a free plan pays often.
+#
+# What this does NOT do is cap memory: once someone asks for a 2026 date the
+# second bundle loads and stays, and the total is the same 327 MB. Eviction was
+# measured and rejected -- dropping one bundle freed nothing (Python returns
+# memory to its own allocator, not the OS) and it re-cost 135 ms on every
+# switch between a 2025 and a 2026 date, which is the page's main interaction.
+#
+# EVERYTHING ELSE READS THE MANIFEST, NOT THE BUNDLE. /models, /health,
+# /counters, /manifest and the trained-on-this-date guard all answer from
+# counter_manifest_<model>.json, which the builder fills with the bundle's own
+# metadata. Otherwise the guard would unpickle 29 MB just to refuse a request,
+# and probing with bad dates would load both models.
+_BUNDLES: dict[str, dict] = {}
+_LOAD_LOCK = threading.Lock()
+
+
+def get_bundle(model: str) -> dict:
+    """The bundle for `model`, loading it on first use.
+
+    The lock matters: the route handlers are sync `def`, so Starlette runs them
+    in a threadpool and two concurrent first-requests would otherwise both
+    unpickle 29 MB -- 140 MB of transient duplicate at the worst moment.
+    """
+    if model not in _BUNDLES:
+        with _LOAD_LOCK:
+            if model not in _BUNDLES:          # re-check: another thread may have won
+                _BUNDLES[model] = predict.load_bundle(
+                    ROOT / "models" / MODEL_FILES[model])
+    return _BUNDLES[model]
 
 # What each model serves. Built by scripts/build_counter_manifest.py as EVERY
 # series the model knows, with a per-series scoreable_2025 flag rather than the
@@ -91,6 +122,10 @@ SCOREABLE = {k: {(c["poste_id"], c["direction"], c["vehicule"])
                  for c in m["served"] if c["scoreable_2025"]}
              for k, m in MANIFESTS.items()}
 MANIFEST = MANIFESTS[DEFAULT_MODEL]
+# The honest accuracy figure for the default model: the FULL unseen year,
+# not the 46-day window, which has Christmas as 2 of its 46 days and
+# overstated the last feature 4.6x. Recorded in the manifest by the builder.
+EXPECTED_MAE = MANIFEST["holdout_mae"]
 
 
 def _pick(model: str) -> str:
@@ -103,11 +138,14 @@ def _pick(model: str) -> str:
 
 
 def _trained_range(model: str) -> tuple[str, str]:
-    """First and last date the model fitted on, as YYYY-MM-DD."""
-    b = BUNDLES[model]
-    built = str(b["profiles_built_from"])            # "2024-01-01..2025-12-31"
-    start = built.split("..")[0]
-    return start, str(b["trained_through"])[:10]
+    """First and last date the model fitted on, as YYYY-MM-DD.
+
+    From the manifest, deliberately: this is called on every /forecast to decide
+    whether to refuse, and reading the bundle here would load 29 MB just to say
+    no.
+    """
+    m = MANIFESTS[model]
+    return str(m["profiles_built_from"]).split("..")[0], str(m["trained_through"])[:10]
 
 
 def _refuse_if_trained_on(model: str, date: str) -> None:
@@ -133,14 +171,6 @@ def _refuse_if_trained_on(model: str, date: str) -> None:
 # Recorded 2025 counts, one file per counter. Read from disk per request rather
 # than held in memory: ~30 MB most callers never ask for.
 ACTUALS = ROOT / "actuals"
-
-# The honest accuracy figure. bundle["scores"] is the 46-day Nov-Dec window,
-# which has Christmas as 2 of its 46 days and so flatters anything
-# holiday-related -- it overstated the last feature 4.6x. bundle["holdout"] is
-# the full unseen year. Quote the holdout.
-_HOLDOUT = (BUNDLE.get("holdout") or {}).get("scores") or []
-EXPECTED_MAE = next((s["MAE"] for s in _HOLDOUT if s["Model"].startswith("model")),
-                    None)
 
 ENDPOINTS = [
     {"path": "/health", "method": "GET",
@@ -172,7 +202,7 @@ ENDPOINTS = [
 @app.get("/")
 def root():
     return {"service": "Luxembourg Traffic Forecast", "version": "3.0",
-            "models": {k: {"trained_through": str(BUNDLES[k]["trained_through"])[:10],
+            "models": {k: {"trained_through": MANIFESTS[k]["trained_through"][:10],
                            "role": MANIFESTS[k]["role"]} for k in MODEL_FILES},
             "default_model": DEFAULT_MODEL,
             "endpoints": ENDPOINTS}
@@ -189,7 +219,7 @@ def models():
     import datetime as _dt
     out = []
     for k in MODEL_FILES:
-        b, m = BUNDLES[k], MANIFESTS[k]
+        m = MANIFESTS[k]
         start, end = _trained_range(k)
         nxt = (_dt.date.fromisoformat(end) + _dt.timedelta(days=1)).isoformat()
         out.append({
@@ -197,14 +227,16 @@ def models():
             "role": m["role"],
             "trained_on": f"{start}..{end}",
             "forecastable_from": nxt,
-            "calendar_through": str(b["calendar_through"].date()),
+            "calendar_through": m["calendar_through"],
             "series_served": m["counts"]["served"],
             "scoreable_2025": m["counts"]["scoreable_2025"],
             "scoreable_years": m["scoreable_years"],
+            "full_year_mae": m["holdout_mae"],
             "blind_test_mae": next(
-                (sc["MAE"] for sc in b["scores"] if sc["Model"].startswith("model")),
-                None),
+                (sc["MAE"] for sc in m["blind_test_scores"]
+                 if sc["Model"].startswith("model")), None),
             "blind_test_window": ("Nov-Dec 2024" if k == "2024" else "Nov-Dec 2025"),
+            "loaded": k in _BUNDLES,
         })
     return {"default": DEFAULT_MODEL, "models": out,
             "note": ("blind_test_mae is each model's own 46-day measurement and the "
@@ -233,20 +265,23 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 def health():
     return {
         "status": "ok",
-        "trained_through": BUNDLE["trained_through"],
-        "features": len(BUNDLE["features"]),
+        "trained_through": MANIFEST["trained_through"],
+        "features": MANIFEST["features"],
         # Full unseen year, NOT the 46-day window. See EXPECTED_MAE above.
         "expected_mae": EXPECTED_MAE,
         "accuracy_basis": "full unseen year 2025",
         "series_served": len(SERVED[DEFAULT_MODEL]),
-        "models": {k: {"trained_through": str(BUNDLES[k]["trained_through"])[:10],
-                       "series_served": MANIFESTS[k]["counts"]["served"]}
+        "models": {k: {"trained_through": MANIFESTS[k]["trained_through"][:10],
+                       "series_served": MANIFESTS[k]["counts"]["served"],
+                       # Lazily loaded: false until something actually forecasts
+                       # with it. Useful for seeing what the worker is holding.
+                       "loaded": k in _BUNDLES}
                    for k in MODEL_FILES},
         # The UI must not offer dates past this -- beyond it the three calendar
         # features would flatten to constants and every Tuesday would return an
         # identical total, January the same as August.
-        "calendar_from": str(BUNDLE["calendar_from"].date()),
-        "calendar_through": str(BUNDLE["calendar_through"].date()),
+        "calendar_from": MANIFEST["calendar_from"],
+        "calendar_through": MANIFEST["calendar_through"],
         "scored_through": MANIFEST.get("scored_through", "2025-12-31"),
     }
 
@@ -343,7 +378,7 @@ def forecast(poste_id: int = Query(...), direction: int = Query(..., ge=1, le=2)
 
     try:
         out = predict.forecast_dates(poste_id, direction, vehicule, date,
-                                     bundle=BUNDLES[model], quiet=True)
+                                     bundle=get_bundle(model), quiet=True)
     except ValueError as ex:
         # Raised by the calendar-coverage guard or an unknown series. Both are
         # deliberate refusals, and the message explains which.
