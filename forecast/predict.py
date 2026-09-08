@@ -75,7 +75,13 @@ def _build_features(
     """
     X = series.merge(pd.DataFrame({"TIME_STAMP": timestamps}), how="cross")
 
-    X = features.add_clock_features(X)                   # arithmetic
+    # month=True since 2026-09-08: MONTH_SIN/COS are in the shipped feature set
+    # (features.FC_FEATURES_WITH_MONTH). Building them unconditionally costs two
+    # float32 columns and keeps this path able to serve BOTH bundle vintages --
+    # build_matrix selects by name, so a 14-feature bundle simply ignores them.
+    # Dropping the flag would make build_matrix raise KeyError on a 16-feature
+    # bundle, which is the loud failure we want rather than a silent one.
+    X = features.add_clock_features(X, month=True)        # arithmetic
     X = cal.add_holiday_features(X)                      # lookup: JSON
     if bundle["profiles"].term_split:
         X = cal.add_term_split_profiles_key(X)

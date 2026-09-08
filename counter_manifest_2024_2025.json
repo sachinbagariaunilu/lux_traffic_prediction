@@ -5,16 +5,16 @@
   "trained_through": "2025-12-31",
   "profiles_built_from": "2024-01-01..2025-12-31",
   "rule": "every series the model can forecast; scoreable_2025 says whether 2025 actuals exist to compare against",
-  "features": 14,
+  "features": 16,
   "calendar_from": "2022-09-15",
   "calendar_through": "2029-09-16",
   "blind_test_scores": [
     {
-      "Model": "model (14 feats)",
-      "MAE": 15.31,
-      "RMSE": 45.26,
-      "R2": 0.9525,
-      "Within_20pct_%": 80.2,
+      "Model": "model (16 feats)",
+      "MAE": 13.38,
+      "RMSE": 39.78,
+      "R2": 0.9633,
+      "Within_20pct_%": 83.0,
       "Rows": 1122288
     },
     {

@@ -5,8 +5,8 @@ Serves TWO models, chosen with ?model= on /counters, /manifest and /forecast:
     model=2024        trained on 2024 only. It has never seen 2025, so a 2025
                       forecast can be scored against actuals/ -- this is the
                       VALIDATION product, the one that proves the method works.
-    model=2024_2025   trained on both years. More accurate on 2026 (13.3% vs
-                      14.4% average error, measured against roadside sensors),
+    model=2024_2025   trained on both years. More accurate on 2026 (11.4% vs
+                      12.5% average error, measured against roadside sensors),
                       but it trained on 2025 and so cannot be honestly scored
                       on any date up to 2025-12-31. FORECASTING product.
 
@@ -242,8 +242,8 @@ def models():
             "note": ("blind_test_mae is each model's own 46-day measurement and the "
                      "windows DIFFER, so the two numbers are not comparable. On the "
                      "one test both models face identically -- June-July 2026 "
-                     "roadside sensors -- 2024_2025 scores 13.3% average error "
-                     "against 14.4% for 2024.")}
+                     "roadside sensors -- 2024_2025 scores 11.4% average error "
+                     "against 12.5% for 2024.")}
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -414,6 +414,6 @@ def forecast(poste_id: int = Query(...), direction: int = Query(..., ge=1, le=2)
             None if model == DEFAULT_MODEL else
             "no full-unseen-year figure exists for this model: it trained on "
             "2025, so there is no year it has not seen. Measured against "
-            "June-July 2026 roadside sensors it averages 13.3% error, "
-            "against 14.4% for model=2024."),
+            "June-July 2026 roadside sensors it averages 11.4% error, "
+            "against 12.5% for model=2024."),
     }

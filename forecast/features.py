@@ -16,11 +16,37 @@ FC_FEATURES: list[str] = [
     "IS_PUBLIC_HOLIDAY", "IS_SCHOOL_HOLIDAY", "DAYS_TO_HOLIDAY",
 ]
 
+# ADOPTED 2026-09-08. Annual seasonality -- the largest single feature gain in
+# this project's history, and the last one available.
+#
 # Built in notebook cell 45 but DROPPED from FC_FEATURES. The stated reason --
 # "training stops in September, October is a month the trees have never seen" --
 # was correct for the dev split and expired once the production model trained on
-# all 12 months. The shipped model therefore has no annual seasonality at all
-# (finding #3). Phase 4: switch on, measure alone, keep only if it earns it.
+# all 12 months. It then stayed off for years because the 46-day Nov-Dec split
+# kept SCORING it as harmful, which it cannot help doing: that split trains
+# Jan-Sep, so November and December are extrapolation and August is absent from
+# both sides. Measured on the two windows:
+#
+#     46-day blind test (Nov-Dec)     14.01 -> 15.76   +1.75   <- the artefact
+#     full year, train 2024/score 2025 13.79 -> 13.02  -0.77   <- the truth
+#
+# Same feature, opposite verdict. The full year is the honest one, and it is the
+# only window in which a seasonal feature CAN be judged.
+#
+# Where the -0.77 comes from, by month (train 2024 -> score 2025):
+#     Aug -2.19   Dec -2.17   Jan -1.18   May -1.16   Jul -0.84   Apr -0.75
+#     Jun/Oct/Nov -0.35   Feb/Sep -0.23   Mar +0.73  <- only regression
+# August and December were the two worst months for the 14-feature model and
+# are the two the old split could never measure. March regressed because Easter
+# moved (31 Mar 2024 -> 20 Apr 2025) and a smooth month encoding cannot
+# represent a moving feast; with one training year it learned "late March is
+# depressed" from a single Easter.
+#
+# Improves every regime, largest gains on the weekend:
+#     Sunday      13.8% of its FIXABLE error removed
+#     Saturday    11.2%
+#     all rows     9.3%
+#     workday peak 6.9%
 MONTH_FEATURES: list[str] = ["MONTH_SIN", "MONTH_COS"]
 
 LAG_FEATURES: list[str] = [
@@ -86,6 +112,14 @@ FC_FEATURES_WITH_CLASS: list[str] = [*FC_FEATURES, *VEHICLE_FEATURES]
 HOLIDAY_PROFILE_FEATURES: list[str] = ["PROF_HOLIDAY_HOUR", "PROF_HOLIDAY_RATIO"]
 
 FC_FEATURES_WITH_HOLIDAY: list[str] = [*FC_FEATURES, *HOLIDAY_PROFILE_FEATURES]
+
+# THE SHIPPED SET as of 2026-09-08. See MONTH_FEATURES for the measurement.
+#
+# Anything appended here must also be buildable by predict.py, which reassembles
+# every feature from a bare date. add_clock_features(month=True) is what supplies
+# the two month columns, and predict.py calls it -- if that call ever loses its
+# month=True, build_matrix raises KeyError rather than predicting nonsense.
+FC_FEATURES_WITH_MONTH: list[str] = [*FC_FEATURES_WITH_HOLIDAY, *MONTH_FEATURES]
 
 # C = Camions (lorries), V = Vehicules legers (cars). Inferred from the volumes
 # -- C averages 10.4 veh/h against V's 183.3, and heavy traffic is the rarer of
