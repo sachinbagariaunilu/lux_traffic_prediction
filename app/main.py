@@ -135,8 +135,12 @@ if COMPANION_URL and "://" not in COMPANION_URL:
     COMPANION_URL = f"https://{COMPANION_URL}"
 
 app = FastAPI(title="Luxembourg Traffic Forecast", version="2.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"],
-                   allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 # Every response is JSON and compresses hard: /counters 306 KB -> 36 KB.
 # uvicorn compresses nothing of its own.
 app.add_middleware(GZipMiddleware, minimum_size=1000)
