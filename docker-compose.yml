@@ -1,13 +1,48 @@
+# Both services, locally, exactly as Render runs them: separate images,
+# separate model sets, separate ports.
+#
+#   docker compose up --build         both
+#   docker compose up --build api     forecast only  -> :8000
+#   docker compose up --build lag     short-horizon  -> :8001
+#
+# Run both when you want to reproduce production routing. Run one when you are
+# working on one -- each builds and boots in isolation, which is the point of
+# the split (see SPLIT_SERVICES.md).
 services:
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: luxtransport:local
     container_name: luxtransport
     ports:
       - "8000:8000"
-    # MODEL_PATH is gone: app/main.py loads models/forecast_model.pkl through
-    # forecast.predict.load_bundle(), and the old value pointed at
-    # forecast_model_2024.pkl, which no longer exists.
+    environment:
+      # Dockerfile already bakes this. Repeated so `docker compose config` shows
+      # which half each container is without opening the Dockerfiles.
+      SERVICE_ROLE: forecast
+      # localhost, not the compose service name: this URL is printed in 404s for
+      # a HUMAN to follow from the host, not fetched container-to-container.
+      COMPANION_URL: http://localhost:8001
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+
+  lag:
+    build:
+      context: .
+      dockerfile: Dockerfile.lag
+    image: luxtransport-lag:local
+    container_name: luxtransport-lag
+    ports:
+      - "8001:8000"
+    environment:
+      SERVICE_ROLE: lag
+      COMPANION_URL: http://localhost:8000
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/health')\""]
       interval: 15s

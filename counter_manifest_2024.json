@@ -12,7 +12,7 @@
     {
       "Model": "model (16 feats)",
       "MAE": 15.64,
-      "RMSE": 43.03,
+      "RMSE": 43.04,
       "R2": 0.9518,
       "Within_20pct_%": 79.6,
       "Rows": 1110576

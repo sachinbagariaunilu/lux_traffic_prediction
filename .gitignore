@@ -56,17 +56,28 @@ models/*.txt
 models/*.onnx
 models/*.h5
 !models/.gitkeep
-# ...EXCEPT the two shipped bundles. Render builds the image from this repo, so
-# the models have to be IN it -- there is no artifact store to pull from.
+# ...EXCEPT the four shipped bundles. Render builds the image from this repo, so
+# the models have to be IN it -- there is no artifact store to pull from. A
+# bundle left ignored here is not a missing file at runtime, it is a FAILED
+# BUILD: Dockerfile COPYs it by name, and Render's build context is the git
+# clone. It builds fine locally, where the context is your working tree and the
+# ignored file is sitting right there -- so this is a gap that only shows up on
+# deploy. That is exactly how the 24h/48h bundles were missed.
 #
-# ~29 MB each, 58 MB together. Both are needed: the API serves the 2024 model
-# for scored 2025 comparisons and the 2024+2025 model for 2026 forecasts, and
-# loads both at import. Well under GitHub's 100 MB per-file limit, but note that
-# every retrain adds another copy to history PERMANENTLY -- at two bundles that
-# is now 58 MB per retrain. If it becomes a problem, move to Git LFS or fetch
-# them from a release asset at build time.
+# ~29 MB each, ~116 MB for all four. Well under GitHub's 100 MB per-file limit,
+# but note that every retrain adds another copy to history PERMANENTLY -- at
+# four bundles that is now ~116 MB per retrain. If it becomes a problem, move to
+# Git LFS or fetch them from a release asset at build time.
+#
+# The forecast service loads these two (Dockerfile):
+#   2024        serves scored 2025 comparisons
+#   2024_2025   serves 2026 onward
 !models/forecast_model_2024.pkl
 !models/forecast_model_2024_2025.pkl
+# The lag service loads these two (Dockerfile.lag). SPLIT_SERVICES.md says why
+# they are a separate deploy.
+!models/forecast_model_24h.pkl
+!models/forecast_model_48h.pkl
 
 
 # Data -- raw CSVs are build-time only and must never be committed.

@@ -1,14 +1,40 @@
+# TWO services from ONE repo. They share every line of source; they differ only
+# in which models they COPY and which routes app/main.py registers, selected by
+# SERVICE_ROLE (baked into each Dockerfile, mirrored here so it is visible).
+#
+# WHY. A Render free instance has 512 MB. Measured resident cost with every
+# bundle forced to load: 346 MB for the two forecast models, 280 MB for the two
+# lag models, and ~540 MB for one process holding all four -- over the cap,
+# before request overhead. Render does not error on that, it OOM-restarts, which
+# looks like requests vanishing and a cold start rather than a fault. Split, each
+# service has real headroom: 166 MB spare here, 232 MB on the lag service.
+#
+# SPLIT_SERVICES.md has the routing table and the migration note for clients.
 services:
+  # ------------------------------------------------------------------------
+  # FORECAST -- the long-horizon models. Answers a bare date.
+  # ------------------------------------------------------------------------
+  # KEEPS ITS NAME, and therefore its URL. Every existing client talks to this
+  # service; the split moved the two short-horizon routes OUT, not this one.
   - type: web
     name: luxtransport-api
     runtime: docker
+    dockerfilePath: ./Dockerfile
     plan: free
     region: frankfurt
     healthCheckPath: /health
-    # No MODEL_PATH. app/main.py loads BOTH bundles at import by fixed name, so
-    # a single path variable could not express it. Renaming a bundle without
-    # editing MODEL_FILES in app/main.py crashes the service on boot -- which is
-    # what an earlier MODEL_PATH pointing at a deleted file did.
+    envVars:
+      # Also ENV in the Dockerfile. Here too so that reading render.yaml tells
+      # you what each service is without opening two Dockerfiles.
+      - key: SERVICE_ROLE
+        value: forecast
+      # Bare hostname from Render; app/main.py prefixes https://. Used only to
+      # tell a caller that hit the wrong service where the other one is.
+      - key: COMPANION_URL
+        fromService:
+          name: luxtransport-lag-api
+          type: web
+          property: host
     #
     # Everything the container needs is committed and COPYed by the Dockerfile:
     #   models/forecast_model_2024.pkl       validation model. Trained on 2024
@@ -24,3 +50,43 @@ services:
     #   counter_manifest_*.json     one per model: what it serves, and which
     #                               series have 2025 actuals to score against
     #   actuals/                    recorded 2025 counts
+    #
+    # No MODEL_PATH. app/main.py loads both bundles by fixed name from
+    # MODEL_FILES, so a single path variable could not express it. Renaming a
+    # bundle without editing MODEL_FILES crashes the service on boot -- which is
+    # what an earlier MODEL_PATH pointing at a deleted file did.
+
+  # ------------------------------------------------------------------------
+  # LAG -- the short-horizon models. Caller supplies recent observed counts.
+  # ------------------------------------------------------------------------
+  # NEW SERVICE, NEW URL. GET /forecast/{lead}h/spec and POST /forecast/{lead}h
+  # used to live on luxtransport-api and now answer here. Anything already
+  # calling them must be repointed; the old service returns a 404 that names
+  # this one rather than a bare "Not Found".
+  - type: web
+    name: luxtransport-lag-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile.lag
+    plan: free
+    region: frankfurt
+    healthCheckPath: /health
+    envVars:
+      - key: SERVICE_ROLE
+        value: lag
+      - key: COMPANION_URL
+        fromService:
+          name: luxtransport-api
+          type: web
+          property: host
+    #
+    # Ships ONLY:
+    #   models/forecast_model_24h.pkl   lead 24: needs counts up to 24h before
+    #   models/forecast_model_48h.pkl   lead 48: survives a feed slipping a day.
+    #                               docs/LEAD_LAG.md 3 argues for this one as
+    #                               the default -- it costs ~0.5 MAE and keeps
+    #                               answering where 24h refuses outright.
+    #   forecast/, data/external/   as above
+    #
+    # NOT shipped: counter_manifest_*.json and actuals/. This service serves no
+    # counter list and no recorded counts. app/main.py guards those reads on
+    # SERVICE_ROLE, so their absence is correct rather than a broken deploy.

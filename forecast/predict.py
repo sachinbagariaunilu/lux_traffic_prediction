@@ -89,6 +89,37 @@ def _build_features(
     return X
 
 
+def apply_growth(pred, timestamps, bundle: dict, pct_per_year: float):
+    """Scale predictions by a CALLER-CHOSEN compound annual growth rate.
+
+    THE ONE IMPLEMENTATION. The CSV export and the API both call this rather
+    than multiplying for themselves -- app/main.py's header records what happened
+    last time prediction logic was duplicated into the backend: 75 lines that
+    silently built 12 of the model's 14 features and served a different model's
+    accuracy figures for months.
+
+    NOT the same thing as apply_level_index(), which raises NotImplementedError
+    and always will. That function wanted to bake a PROJECTED rate into the
+    bundle. This one takes the rate FROM THE CALLER, defaults to zero, and
+    reports what it did -- which is the difference between an assumption someone
+    owns and an assumption nobody can see.
+
+    Counted from the BUNDLE's own trained_through, so it cannot drift when the
+    model is retrained. measure_growth.TRAINING_BASE_YEAR is a module constant
+    still set to 2024 while the shipped bundle trains through 2025; anything
+    using that against this bundle double-counts a year.
+
+    The measured band is 0.0-1.0%/yr and the central estimate 0.5%. On paired
+    slots the network grew +0.13% one year and +1.03% the next, and freight
+    changed sign -- which is why no rate is baked in and why this defaults to 0.
+    """
+    if not pct_per_year:
+        return pred, None
+    base = pd.Timestamp(bundle["trained_through"]).year
+    years = pd.DatetimeIndex(timestamps).year.to_numpy() - base
+    return pred * (1.0 + pct_per_year / 100.0) ** years, base
+
+
 def forecast_dates(
     poste_id: int,
     direction: int,
@@ -98,8 +129,14 @@ def forecast_dates(
     *,
     bundle: dict | None = None,
     quiet: bool = False,
+    growth_pct_per_year: float = 0.0,
 ) -> pd.DataFrame:
     """Hourly forecast for one series over [start, end], inclusive.
+
+    growth_pct_per_year defaults to 0.0 -- the model's honest zero-growth
+    answer. Pass a rate to scale by compound annual growth from the bundle's
+    trained_through; the rate and base year come back as columns so the
+    assumption travels with the numbers. See apply_growth().
 
     Raises rather than guessing in two cases:
       - the range extends past the calendar horizon (would be holiday-blind)
@@ -110,6 +147,7 @@ def forecast_dates(
     measured within 0.04 MAE of a full one.
     """
     bundle = bundle or load_bundle()
+    _require_forecast_bundle(bundle, "forecast_dates")
     a = pd.Timestamp(start).normalize()
     b = pd.Timestamp(end).normalize() if end is not None else a
 
@@ -129,6 +167,8 @@ def forecast_dates(
     unmatched = int(X["PROF_DOW_HOUR"].isna().sum())
     pred = np.clip(bundle["model"].predict(
         features.build_matrix(X, bundle["features"])), 0, None)
+    pred, growth_base = apply_growth(pred, X["TIME_STAMP"], bundle,
+                                     growth_pct_per_year)
 
     if not quiet:
         note = bundle["profiles"].series_note(poste_id, direction, vehicule)
@@ -138,12 +178,153 @@ def forecast_dates(
             print(f"  note: {unmatched} of {len(X)} hours had no (weekday, hour) "
                   f"profile; those predictions are weaker than they look")
 
-    return pd.DataFrame({
+    out = pd.DataFrame({
         "TIME_STAMP": X["TIME_STAMP"].to_numpy(),
         "PREDICTED": pred.round(1),
         "typical_for_slot": X["PROF_DOW_HOUR"].round(1).to_numpy(),
         "is_public_holiday": X["IS_PUBLIC_HOLIDAY"].to_numpy(),
         "is_school_holiday": X["IS_SCHOOL_HOLIDAY"].to_numpy(),
+    })
+    if growth_base is not None:
+        out["growth_pct_per_year"] = growth_pct_per_year
+        out["growth_base_year"] = growth_base
+    return out
+
+
+def _require_forecast_bundle(bundle: dict, fn: str) -> None:
+    """Refuse a lag bundle on the lag-free path.
+
+    A short-horizon bundle's feature list contains LAG_24 and friends, none of
+    which _build_features() produces -- so without this the failure is a
+    build_matrix KeyError naming a column, several frames from the actual
+    mistake, which is that the wrong .pkl was loaded. Named here instead.
+    """
+    if bundle.get("lead") is not None:
+        raise ValueError(
+            f"{fn}() needs a FORECAST bundle and this one is "
+            f"{bundle['kind']!r}. It carries lag features, so it cannot answer "
+            f"a bare date -- not worse, NOT AT ALL. Use "
+            f"forecast_with_history(), or load models/forecast_model_2024.pkl.")
+
+
+def _require_lag_bundle(bundle: dict, fn: str) -> int:
+    """The mirror image, returning the lead so callers need not re-read it."""
+    lead = bundle.get("lead")
+    if lead is None:
+        raise ValueError(
+            f"{fn}() needs a SHORT-HORIZON bundle and this one is "
+            f"{bundle.get('kind')!r}. A lag-free model gives the same answer "
+            f"24 hours out as four years out, so feeding it history buys "
+            f"nothing. Use forecast_dates().")
+    return int(lead)
+
+
+def forecast_with_history(
+    poste_id: int,
+    direction: int,
+    vehicule: str,
+    start,
+    end=None,
+    *,
+    history: pd.DataFrame,
+    bundle: dict,
+    quiet: bool = False,
+) -> pd.DataFrame:
+    """Hourly forecast for one series, using OBSERVED counts up to target-lead.
+
+    This is the path LEAD_LAG.md 8.4 records as missing. It is deliberately a
+    separate function from forecast_dates() rather than a flag on it: the two
+    products have different INPUTS, not different options, and a flag would
+    make the bundle's "needs no live data" promise a typo away from a lie.
+
+    `history` needs TIME_STAMP and TRAFFIC_VOLUME for THIS series, hourly,
+    covering at least bundle["history_hours"] before the first target. Gaps are
+    fine -- they become NaN and LightGBM routes them -- but the RECENCY is not
+    negotiable and is checked below.
+
+    WHY THE HISTORY AND THE TARGETS GO INTO ONE FRAME. The lag builder groups by
+    series and sorts by time, then shifts. Targets appended to their own history
+    get correct lags; targets built alone get all-NaN ones. That is the same
+    ordering requirement as train.run_measurement(), for the same reason.
+
+    NOTHING HERE READS FORWARD OF T = target - lead. The admissibility rule
+    (lag k usable iff k >= lead) is enforced inside add_lead_lag_features, and
+    the rolling windows are shifted by `lead` before they roll. The target rows
+    carry NaN as their own TRAFFIC_VOLUME, so even an accidental zero-lag could
+    not leak an answer -- there is nothing there to leak.
+    """
+    lead = _require_lag_bundle(bundle, "forecast_with_history")
+    a = pd.Timestamp(start).normalize()
+    b = pd.Timestamp(end).normalize() if end is not None else a
+    cal.assert_covers(a, b)
+
+    targets = pd.date_range(a, b + pd.Timedelta(hours=23), freq="h")
+    need_from = targets[0] - pd.Timedelta(hours=int(bundle["history_hours"]))
+    latest_usable = targets[0] - pd.Timedelta(hours=lead)
+
+    hist = history.loc[:, ["TIME_STAMP", config.TARGET]].copy()
+    hist["TIME_STAMP"] = pd.to_datetime(hist["TIME_STAMP"])
+    hist = hist[hist["TIME_STAMP"] < targets[0]].sort_values("TIME_STAMP")
+
+    if hist.empty:
+        raise ValueError(
+            f"no history before {targets[0]}. This bundle needs "
+            f"{bundle['history_hours']}h of observed counts ending no earlier "
+            f"than {latest_usable}.")
+
+    # THE RECENCY CHECK IS THE PRODUCT SPEC, ENFORCED. LEAD_LAG.md 3 prices
+    # staleness: counts within 24h are worth 2.38 MAE over none, within a week
+    # 0.20. A caller passing week-old data would get a silently worse forecast
+    # that still looks like a forecast, so this refuses instead.
+    last = hist["TIME_STAMP"].max()
+    if last < latest_usable:
+        raise ValueError(
+            f"history ends {last}, but a forecast from {targets[0]} needs "
+            f"counts through {latest_usable} (lead {lead}h). Stale by "
+            f"{(latest_usable - last) / pd.Timedelta(hours=1):.0f}h. "
+            f"Refusing rather than returning a degraded forecast that looks "
+            f"like a good one -- see LEAD_LAG.md 3.")
+    if not quiet and hist["TIME_STAMP"].min() > need_from:
+        short = (hist["TIME_STAMP"].min() - need_from) / pd.Timedelta(hours=1)
+        print(f"  note: history starts {short:.0f}h later than the "
+              f"{bundle['history_hours']}h this bundle wants; the longest lags "
+              f"will be NaN for the earliest targets")
+
+    keys = {"POSTE_ID": np.int32(poste_id), "DIRECTION": np.int8(direction),
+            "VEHICULE": str(vehicule)}
+    # float32 on BOTH sides before the concat. The target rows carry an all-NaN
+    # TRAFFIC_VOLUME, and pandas warns (and will change behaviour) when it has
+    # to infer a dtype for an all-NA column being concatenated -- an integer
+    # history column would otherwise be silently widened to object.
+    hist[config.TARGET] = hist[config.TARGET].astype("float32")
+    tgt = pd.DataFrame({"TIME_STAMP": targets, **keys})
+    tgt[config.TARGET] = np.full(len(targets), np.nan, dtype="float32")
+    frame = pd.concat([hist.assign(**keys), tgt], ignore_index=True)
+
+    frame = features.add_clock_features(frame, month=True)
+    frame = cal.add_holiday_features(frame)
+    frame = features.add_lead_lag_features(
+        frame, lead=lead, dropna=False, long=bool(bundle.get("long_lags")))
+    if bundle["profiles"].term_split:
+        frame = cal.add_term_split_profiles_key(frame)
+    frame = features.attach_profiles(frame, bundle["profiles"], warn_missing=False)
+    frame = features.add_recent_vs_profile(frame)
+
+    out = frame[frame["TIME_STAMP"].isin(targets)].sort_values("TIME_STAMP")
+    if out["PROF_MEAN"].isna().all():
+        raise ValueError(
+            f"counter ({poste_id}, {direction}, {vehicule!r}) is unknown to "
+            f"this model -- no history in {bundle['profiles'].built_from}")
+
+    pred = np.clip(bundle["model"].predict(
+        features.build_matrix(out, bundle["features"])), 0, None)
+
+    return pd.DataFrame({
+        "TIME_STAMP": out["TIME_STAMP"].to_numpy(),
+        "PREDICTED": pred.round(1),
+        "typical_for_slot": out["PROF_DOW_HOUR"].round(1).to_numpy(),
+        "is_public_holiday": out["IS_PUBLIC_HOLIDAY"].to_numpy(),
+        "is_school_holiday": out["IS_SCHOOL_HOLIDAY"].to_numpy(),
     })
 
 
@@ -164,6 +345,7 @@ def forecast_series(
     bundle["profiles"].provenance[config.GROUP] for the full set.
     """
     bundle = bundle or load_bundle()
+    _require_forecast_bundle(bundle, "forecast_series")
     a = pd.Timestamp(start).normalize()
     b = pd.Timestamp(end).normalize() if end is not None else a
 

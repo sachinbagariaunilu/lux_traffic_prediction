@@ -1,7 +1,18 @@
+# The FORECAST service. Long-horizon models, answerable from a bare date.
+# Its twin is Dockerfile.lag -- same source tree, different models and routes.
+# SPLIT_SERVICES.md says why, and app/main.py's SERVICE_ROLE block has the
+# memory measurements that forced it.
 FROM python:3.9-slim
 
 WORKDIR /app
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+
+# BAKED INTO THE IMAGE, not left to render.yaml. The role decides which models
+# are loaded and which routes exist, and this image ships only the forecast
+# bundles -- so an env var lost in a dashboard edit would start a service whose
+# lag routes 503 on every call. Overridable for local experiments; never
+# override it in a deploy.
+ENV SERVICE_ROLE=forecast
 
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
@@ -18,7 +29,11 @@ COPY app/ ./app/
 # corrupt model file rather than a missing package.
 COPY forecast/ ./forecast/
 
-COPY models/ ./models/
+# ONLY the two long-horizon bundles. Not `COPY models/`, which would sweep in
+# the 24h and 48h models as well: 56 MB of image that this service can never
+# route to, and a standing invitation for someone to "just load them here" and
+# push the instance back over the 512 MB cap that the split exists to avoid.
+COPY models/forecast_model_2024.pkl models/forecast_model_2024_2025.pkl ./models/
 
 # The holiday calendar and site metadata, read at CALL TIME rather than baked
 # into the .pkl. That is what lets the calendar be extended to 2030 without

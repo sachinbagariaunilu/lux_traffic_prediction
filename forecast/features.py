@@ -62,9 +62,40 @@ UNUSED_RAW_COLUMNS: list[str] = [
     "LOCALITE", "ROUTE", "SENS", "D1", "D2", "COORD_X", "COORD_Y",
 ]
 
-# Phase 4 item 4. PROF_STD is currently the model's only signal about spread;
-# percentiles tell it "this slot is usually 300 but sometimes 600", which is
-# real information about how spiky a slot is.
+# MEASURED 2026-09-14 AND REJECTED. Was "Phase 4 item 4", proposed on the
+# argument that PROF_STD is the model's only spread signal and percentiles would
+# tell it "this slot is usually 300 but sometimes 600". build_profiles(robust=
+# True) had been implemented for that long and had never appeared in a single
+# runs.jsonl entry.
+#
+#   FULL YEAR, train 2024 score 2025, 8,705,856 rows:
+#       16 features            13.02   peak band 22.915
+#       19 (+ the three)       13.05   peak band 22.974
+#
+#   +0.030 MAE, WORSE, and worse in every hour band. 21 of 24 hours degraded.
+#
+# AND IT COSTS 9x THE FIT TIME: 1128s against 121s. PROF_P90 and PROF_IQR are
+# lambda quantile aggregations inside a 1,070-group groupby, where PROF_MEAN and
+# PROF_STD are vectorised. A feature that made the model worse and the fit nine
+# times slower is not a close call.
+#
+# THE PATTERN THIS COMPLETES, and it is worth more than either result. Two
+# independent series-level scalar proposals were measured on the same full year
+# in the same week, and BOTH landed at exactly +0.030 MAE:
+#
+#     peak AM/PM ratios   (2 columns)   13.02 -> 13.05
+#     median/P90/IQR      (3 columns)   13.02 -> 13.05
+#
+# The model already carries PROF_MEAN, PROF_STD, PROF_HOUR, PROF_DOW_HOUR,
+# PROF_HOLIDAY_HOUR and PROF_HOLIDAY_RATIO. THE SERIES-LEVEL DESCRIPTION OF A
+# COUNTER IS SATURATED: further per-series numbers give 800 trees more ways to
+# fit training-year noise and nothing new to fit. Expect any further feature of
+# this shape to cost about +0.03, and do not spend a fit finding out.
+#
+# What DID move this model, for contrast: long lags -1.41, month features -0.77,
+# holiday profiles -0.23. Two of those three are ROW-level and time-varying; the
+# third supplied a dimension the profile key genuinely lacked. That is the shape
+# of a feature worth trying.
 ROBUST_PROFILE_FEATURES: list[str] = ["PROF_MEDIAN", "PROF_P90", "PROF_IQR"]
 
 # FINDING #17. VEHICULE is absent from FC_FEATURES, so the model cannot tell a
@@ -113,6 +144,37 @@ HOLIDAY_PROFILE_FEATURES: list[str] = ["PROF_HOLIDAY_HOUR", "PROF_HOLIDAY_RATIO"
 
 FC_FEATURES_WITH_HOLIDAY: list[str] = [*FC_FEATURES, *HOLIDAY_PROFILE_FEATURES]
 
+# TRIED AND REMOVED 2026-09-14: per-counter peak AM/PM ratios.
+#
+# Two scalars per series -- workday morning-peak mean / overall mean, and the
+# same for the evening -- built exactly like PROF_HOLIDAY_RATIO. A screen before
+# building looked promising: they correlate only -0.42 and +0.53 with the
+# shipped holiday ratio, and -0.79 with EACH OTHER, so they carried information
+# no other series-level feature had.
+#
+#   January 2025 holdout, 742,920 rows   11.98 -> 11.96   peak band -0.101
+#   FULL YEAR, train 2024 score 2025     13.02 -> 13.05   peak band +0.076
+#   8,705,856 rows                                        8 of 12 months WORSE
+#
+# THE SIGN FLIPPED. January is genuinely one of four months where the pair
+# helps; on the other eight it hurts, including at the peak hours it was built
+# for. The single-month result was a property of January, not of the feature.
+#
+# WHY IT CANNOT WORK, and this generalises to any future proposal of the same
+# shape: PROF_DOW_HOUR is already keyed on (counter, direction, vehicle,
+# DAY_OF_WEEK, HOUR, term), so the model holds hour-of-day at FULL resolution
+# already. A per-counter peak scalar is a coarse summary of something it knows
+# exactly, and the two spare columns only give the trees more ways to fit noise.
+#
+# PROF_HOLIDAY_RATIO works because the key is NOT is keyed on holiday status --
+# it supplied a missing dimension. THE RULE: a per-counter ratio helps where the
+# profile key LACKS that dimension and hurts where the key already carries it.
+# A weekend ratio was screened out the same day at r=+0.92 with the holiday
+# ratio, so it was never built.
+#
+# Peak hours remain 48% of all error with 8.07% headroom -- still the largest
+# fixable block, and not reachable from the calendar side.
+
 # THE SHIPPED SET as of 2026-09-08. See MONTH_FEATURES for the measurement.
 #
 # Anything appended here must also be buildable by predict.py, which reassembles
@@ -120,6 +182,94 @@ FC_FEATURES_WITH_HOLIDAY: list[str] = [*FC_FEATURES, *HOLIDAY_PROFILE_FEATURES]
 # the two month columns, and predict.py calls it -- if that call ever loses its
 # month=True, build_matrix raises KeyError rather than predicting nonsense.
 FC_FEATURES_WITH_MONTH: list[str] = [*FC_FEATURES_WITH_HOLIDAY, *MONTH_FEATURES]
+
+
+# --------------------------------------------------------------------------
+# Lead-anchored lags -- a THIRD product, not a better shipped model
+# --------------------------------------------------------------------------
+#
+#   FORECAST (shipped)  unlimited horizon   no lags     any date, no live data
+#   this                 fixed 24h lead     lag >= 24   needs data up to T-24h
+#   NOWCAST              1h                 lag >= 1    needs data up to T-1h
+#
+# The admissibility rule that separates them is one line, in
+# add_lead_lag_features(): a lag of k hours is usable at lead L iff k >= L.
+#
+# NEVER append these to FC_FEATURES_WITH_MONTH and never let them reach
+# train.build_bundle(). Its `kind` field promises "forecast (no lags) -- any
+# date, needs no live data", and a bundle carrying lag features cannot answer a
+# 2028 date AT ALL (IMPROVEMENTS.md 1a). That is why this set has its own list,
+# its own builder and its own script rather than a flag on forecast.train.
+LAG_LADDER: tuple[int, ...] = (1, 2, 24, 48, 168)
+ROLL_WINDOWS: tuple[int, ...] = (3, 24, 168)
+
+# PROPOSED 2026-09-09, opt-in, UNMEASURED. scripts/lead_lag.py --long-lags.
+#
+# WHERE THIS CAME FROM. The Chronos-2 benchmark (docs/CHRONOS_STUDY.md) beat the
+# lead-24 model by 2.7 MAE on identical rows with NO training and NO calendar
+# features, and the whole gap sits at peak hours -- at 16:00, mean volume 210
+# veh/h, LightGBM is out by 48.4 and Chronos by 36.3. The one input Chronos has
+# more of is RECENT HISTORY OF THAT SERIES: it reads 1,024 hours where the
+# ladder above stops at 168, so this model looks back 7 days and Chronos looks
+# back 42.
+#
+# THE HYPOTHESIS. That 6x window is the gap. The 9 months LightGBM does have are
+# baked in as a STATIC average -- PROF_DOW_HOUR is "this counter, this weekday,
+# this hour, over Jan-Sep" -- and an average cannot say "this counter has run
+# 10% busier for the past month". That is the same you-cannot-un-blend-an-average
+# argument as TERM_SPLIT and HOLIDAY_SPLIT in train.py, one level up. If it is
+# right, 336 and 720 close part of the 2.7 -- with no torch, no 42-day horizon
+# cap, no hosting upgrade, and no change to the shipped bundle.
+#
+# WHAT WOULD FALSIFY IT. A gap under ~0.3 MAE against the 168-hour ladder on the
+# same rows says long history is not what Chronos is using, and the advantage is
+# architectural rather than informational. That is a real answer too, and it
+# closes this line of work rather than leaving it open.
+#
+# SEPARATE CONSTANTS, NOT AN EDIT TO THE ONES ABOVE, and the reason is not
+# tidiness: LAG_LADDER is what produced every figure in docs/LEAD_LAG.md. Change
+# it in place and 13.26 stops being reproducible, and `n_features` -- one of the
+# three keys recorded_control() matches runs on -- shifts under every stored run
+# at once. The default path must keep answering the question it answered before.
+LAG_LADDER_LONG: tuple[int, ...] = (1, 2, 24, 48, 168, 336, 720)
+ROLL_WINDOWS_LONG: tuple[int, ...] = (3, 24, 168, 720)
+
+
+def lead_lag_feature_names(lead: int, *, long: bool = False) -> list[str]:
+    """The lag columns admissible at `lead`, in build order.
+
+    Derived from LAG_LADDER rather than hardcoded, so the feature LIST and the
+    BUILDER cannot disagree about which lags exist at a given lead -- the class
+    of bug build_matrix()'s ordering check exists to catch.
+
+        lead 24  ->  LAG_24, LAG_48, LAG_168 + windows + the two ratios   (9)
+        lead 1   ->  adds LAG_1, LAG_2                                    (11)
+
+    At lead 1 the result is a strict SUPERSET of LAG_FEATURES, which is what
+    makes the sanity check in scripts/lead_lag.py --sanity meaningful.
+
+    long=True swaps in LAG_LADDER_LONG / ROLL_WINDOWS_LONG -- see those
+    constants for the hypothesis. At lead 24 that is 11 lag columns instead of
+    9, and it is a DIFFERENT MODEL: score it against a control on the same rows,
+    never against a stored figure built on the short ladder.
+    """
+    if lead < 1:
+        raise ValueError(f"lead must be >= 1, got {lead}")
+    ladder = LAG_LADDER_LONG if long else LAG_LADDER
+    roll = ROLL_WINDOWS_LONG if long else ROLL_WINDOWS
+    return [
+        *[f"LAG_{k}" for k in ladder if k >= lead],
+        *[f"MEAN_LAST_{w}H" for w in roll],
+        "STD_LAST_3H",
+        "SAME_HOUR_MEAN_7D",
+        "RECENT_VS_PROFILE",
+    ]
+
+
+def lead_features(lead: int = 24, *, long: bool = False) -> list[str]:
+    """The shipped feature set PLUS the lags admissible at `lead`."""
+    return [*FC_FEATURES_WITH_MONTH, *lead_lag_feature_names(lead, long=long)]
+
 
 # C = Camions (lorries), V = Vehicules legers (cars). Inferred from the volumes
 # -- C averages 10.4 veh/h against V's 183.3, and heavy traffic is the rarer of
@@ -378,6 +528,7 @@ def build_profiles(
                   f"observations; PROF_HOLIDAY_RATIO defaults to 1.0 for them")
         series["PROF_HOLIDAY_RATIO"] = series["PROF_HOLIDAY_RATIO"].fillna(1.0)
 
+
     span = train["TIME_STAMP"]
     span_hours = (span.max() - span.min()) / pd.Timedelta(hours=1) + 1
     provenance = (train.groupby(config.GROUP, observed=True)["TIME_STAMP"]
@@ -559,6 +710,131 @@ def add_lag_features(d: pd.DataFrame, *, dropna: bool = True) -> pd.DataFrame:
     if dropna:
         out = out.dropna(subset=["LAG_168"]).reset_index(drop=True)
     return out
+
+
+def add_lead_lag_features(
+    d: pd.DataFrame,
+    *,
+    lead: int = 24,
+    dropna: bool = False,
+    long: bool = False,
+) -> pd.DataFrame:
+    """Attach the lags KNOWN at issue time T = target - `lead` hours.
+
+    THE RULE, and the only thing that makes this honest:
+
+        a lag of k hours is usable at lead L   <=>   k >= L
+
+    At lead 24 that kills LAG_1, LAG_2 and any window ending at target-1 -- five
+    of the seven LAG_FEATURES. Those are not missing values to impute, they are
+    numbers that DO NOT EXIST YET at issue time (IMPROVEMENTS.md 1a). The rule
+    is enforced here, not remembered: LAG_LADDER is filtered by it and the
+    rolling windows are shifted by `lead` before they roll.
+
+    dropna=False by DEFAULT, the opposite of add_lag_features(). LightGBM routes
+    NaN natively, so the 168h warm-up rows and the 4.3% grid gaps stay in the
+    frame as NaN instead of being deleted. Three things follow:
+
+      - the row set stays IDENTICAL to the no-lag run, which is what makes the
+        two MAEs comparable rather than merely adjacent;
+      - a counter going offline costs a handful of NaN cells instead of breaking
+        169 hours of chain;
+      - data.assert_no_lag_truncation() (the BUG 16 guard) stays satisfied.
+
+    Every lag is GROUPED by series, as in add_lag_features -- ungrouped
+    shift/rolling reaches across series boundaries and pulls a motorway's values
+    into a village lane (findings #10, #11).
+
+    long=True builds from LAG_LADDER_LONG / ROLL_WINDOWS_LONG. It MUST match the
+    `long` passed to lead_lag_feature_names() -- build_matrix() would otherwise
+    be handed a name that no column satisfies, or silently drop a built column.
+    The single `long` flag threaded from scripts/lead_lag.py is what keeps the
+    list and the builder from disagreeing, which is the whole reason the ladder
+    is a constant and not two hardcoded lists.
+
+    NOTE the warm-up cost: LAG_720 is NaN for the first 30 days of every series
+    and MEAN_LAST_720H is thin behind that (min_periods=1, so it averages what
+    it has). dropna=False keeps those rows, so the row set -- and therefore
+    comparability with the control -- is unchanged.
+    """
+    if lead < 1:
+        raise ValueError(f"lead must be >= 1, got {lead}")
+    if "HOUR" not in d.columns:
+        raise KeyError("add_lead_lag_features needs HOUR -- run add_clock_features first")
+
+    ladder = LAG_LADDER_LONG if long else LAG_LADDER
+    roll = ROLL_WINDOWS_LONG if long else ROLL_WINDOWS
+
+    out = d.sort_values([*config.GROUP, "TIME_STAMP"]).reset_index(drop=True)
+    keys = [out[c] for c in config.GROUP]
+    grouped = out.groupby(config.GROUP, observed=True)[config.TARGET]
+
+    for k in ladder:
+        if k < lead:
+            continue                      # inadmissible at this lead
+        out[f"LAG_{k}"] = grouped.shift(k).astype("float32")
+
+    # shift(lead) BEFORE rolling, so every window ENDS at or before T. Same
+    # reason add_lag_features shifts by 1 first: a window that reaches the
+    # target hour leaks the answer into its own feature.
+    shifted = grouped.shift(lead)
+    by_series = shifted.groupby(keys, observed=True)
+    for w in roll:
+        out[f"MEAN_LAST_{w}H"] = by_series.transform(
+            lambda s, w=w: s.rolling(w, min_periods=1).mean()).astype("float32")
+
+    # NOT .fillna(0) -- add_lag_features does that and it makes a claim it
+    # cannot support. NaN means "spread unknown"; 0 means "measured, no
+    # variation". LightGBM can route the first and will believe the second.
+    out["STD_LAST_3H"] = by_series.transform(
+        lambda s: s.rolling(3, min_periods=2).std()).astype("float32")
+
+    # SAME_HOUR_MEAN_7D -- this counter, THIS HOUR, over the last 7 days.
+    # Within (series, HOUR) the frame is DAILY, so one shift is one day and
+    # ceil(lead/24) days back is the last fully observed one. An adaptive
+    # PROF_DOW_HOUR: same question, answered from the last week instead of the
+    # whole training period.
+    days_back = -(-lead // 24)
+    hour_keys = [*config.GROUP, "HOUR"]
+    same_hour = out.groupby(hour_keys, observed=True)[config.TARGET].shift(days_back)
+    out["SAME_HOUR_MEAN_7D"] = (
+        same_hour.groupby([out[c] for c in hour_keys], observed=True)
+                 .transform(lambda s: s.rolling(7, min_periods=2).mean())
+                 .astype("float32"))
+
+    if dropna:
+        out = out.dropna(subset=[f"LAG_{max(ladder)}"]).reset_index(drop=True)
+    return out
+
+
+def add_recent_vs_profile(d: pd.DataFrame) -> pd.DataFrame:
+    """RECENT_VS_PROFILE = SAME_HOUR_MEAN_7D / PROF_DOW_HOUR.
+
+    A SEPARATE function because the ordering is a real dependency: this needs
+    attach_profiles() AND add_lead_lag_features() to have run. A named call site
+    is a better place to discover that than a KeyError at fit time.
+
+    What it encodes: "this counter is currently running 6% above its own
+    historical profile". No calendar feature can express that -- it is the one
+    signal in this set aimed at the LEVEL rather than the shape, and the level is
+    a known, measured weakness (config.TRAIN_YEARS: the shipped model still
+    under-counts the 2026 sensors by 3.3%).
+
+    Guard: PROF_DOW_HOUR is a mean of counts and CAN be 0 for a genuinely dead
+    (counter, weekday, hour). Both 0/0 and x/0 become NaN, never inf -- LightGBM
+    routes NaN, and an inf would poison a split threshold.
+    """
+    for need in ("SAME_HOUR_MEAN_7D", "PROF_DOW_HOUR"):
+        if need not in d.columns:
+            raise KeyError(
+                f"add_recent_vs_profile needs {need}. Run add_lead_lag_features "
+                f"and attach_profiles first, in that order.")
+
+    prof = d["PROF_DOW_HOUR"].to_numpy(dtype="float64")
+    recent = d["SAME_HOUR_MEAN_7D"].to_numpy(dtype="float64")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(prof > 0, recent / prof, np.nan)
+    return d.assign(RECENT_VS_PROFILE=ratio.astype("float32"))
 
 
 # --------------------------------------------------------------------------

@@ -90,6 +90,28 @@ REPORTS = ROOT / "reports" / "metrics"
 # sensors, not the same counting network) and puts all three models on
 # identical rows. But it is not a clean sweep, and anyone re-running this
 # should know both numbers exist.
+# RE-MEASURED 2026-09-08 after adopting MONTH_SIN/COS. Same 4,340 sensor hours,
+# same script (scripts/sensor_comparison_2026.py, which now exists -- the figures
+# above came from an ad-hoc run that could not be reproduced):
+#
+#   model        MAE    err     shortfall   within 20%
+#   2024 only    70.2   12.5%     -6.6%        85%
+#   2024+2025    62.9   11.4%     -3.3%        87%   <- ships
+#
+# Month features improved BOTH models by ~1.9 points of error and 7-8 points of
+# within-20%. The shortfall matters most: it nearly halved for the shipping model
+# (-5.6% -> -3.3%) even though month features carry no trend term.
+#
+# That reframes the paragraph above. June and July run ~9-10% above the annual
+# average (month factors 1.092 and 1.104), so a model with no month feature
+# predicts the annual mean and MUST under-count summer. Much of what was recorded
+# here as "a level problem that a year of extra history only half fixes" was a
+# missing-seasonality problem instead. Some genuine level gap remains -- -3.3% is
+# not zero -- but it is half what it appeared to be.
+#
+# CAUTION when comparing to the table above: those rows are 14-feature bundles
+# and these are 16-feature. The 2025-only bundle was deleted, so it cannot be
+# re-measured and has no row here.
 TRAIN_YEARS = [2024, 2025]
 
 # Years PERMITTED to sit in data/raw. Deliberately separate from TRAIN_YEARS,

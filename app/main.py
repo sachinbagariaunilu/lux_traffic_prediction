@@ -1,5 +1,20 @@
 """Luxembourg traffic forecast API.
 
+ONE FILE, TWO DEPLOYED SERVICES. SERVICE_ROLE decides which half this process
+is -- which models it loads and which routes it registers. See the SERVICE_ROLE
+block below for the memory measurements that forced the split, and
+SPLIT_SERVICES.md for the routing table.
+
+    SERVICE_ROLE=forecast   the LONG-HORIZON models, below. Answers a bare date.
+    SERVICE_ROLE=lag        the SHORT-HORIZON models. The caller supplies recent
+                            observed counts; more accurate, but only within the
+                            model's lead. GET /forecast/{lead}h/spec, POST
+                            /forecast/{lead}h.
+    SERVICE_ROLE=all        both, in one process. Local use only -- it does not
+                            fit a 512 MB instance.
+
+The rest of this docstring is the forecast half.
+
 Serves TWO models, chosen with ?model= on /counters, /manifest and /forecast:
 
     model=2024        trained on 2024 only. It has never seen 2025, so a 2025
@@ -47,18 +62,77 @@ insert it (see scripts/build_counter_manifest.py).
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Request
+import pandas as pd
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from forecast import predict
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# --------------------------------------------------------------------------
+# SERVICE ROLE -- which half of the API this process is
+# --------------------------------------------------------------------------
+#
+# WHY THERE ARE TWO. Four bundles do not fit one 512 MB Render instance.
+# MEASURED, uvicorn --workers 1, RSS after forcing every bundle to load:
+#
+#   SERVICE_ROLE=forecast   /forecast, /counters, /manifest, /actuals, /models
+#                           models/forecast_model_2024.pkl and _2024_2025.pkl
+#                           87 MB idle -> 257 MB one bundle -> 346 MB both
+#   SERVICE_ROLE=lag        GET /forecast/{lead}h/spec and POST /forecast/{lead}h
+#                           models/forecast_model_24h.pkl and _48h.pkl
+#                           82 MB idle -> 256 MB one bundle -> 280 MB both
+#
+# One process holding all four is 346 + 280 - 85 (the shared interpreter and
+# libraries, counted once) = ~540 MB, over the cap BEFORE request overhead.
+# Render does not error on that -- it OOM-restarts, which reads as requests
+# vanishing and a cold start rather than a fault, so it is the kind of failure
+# that gets misdiagnosed for a week.
+#
+# Split, each service has genuine headroom: 166 MB spare on the forecast
+# service, 232 MB on the lag service.
+#
+# Those figures are macOS, so treat them as the SHAPE rather than the exact
+# Linux numbers -- but they agree with the 327 MB that get_bundle()'s comment
+# below records for the two forecast bundles on the deployed platform, which is
+# the one figure measured on Render itself.
+#
+# ONE codebase, not two repos. A fork would drift, and this file's header
+# records what it cost the last time prediction logic lived in two places.
+# Dockerfile builds the forecast image and Dockerfile.lag the lag image; each
+# COPYs only its OWN bundles and bakes its role in as ENV, so a service cannot
+# be started against the wrong models by forgetting an environment variable.
+#
+# SERVICE_ROLE=all is the old single-service behaviour, kept for local work
+# where memory is not 512 MB. Do not deploy it to the free plan.
+ROLE = os.environ.get("SERVICE_ROLE", "all").strip().lower()
+if ROLE not in {"forecast", "lag", "all"}:
+    raise RuntimeError(
+        f"SERVICE_ROLE={ROLE!r} is not one of forecast, lag, all. This is "
+        f"deliberately fatal at import: a typo that silently fell back to a "
+        f"default would deploy a service serving the wrong half of the API.")
+SERVES_FORECAST = ROLE in {"forecast", "all"}
+SERVES_LAG = ROLE in {"lag", "all"}
+
+# Where the other half lives, so a caller that hits the wrong service is TOLD
+# where to go rather than getting a bare 404. Optional -- set it in render.yaml
+# once both services have URLs. Splitting one API into two is exactly the
+# change that breaks existing clients silently, and this is the antidote.
+COMPANION_URL = os.environ.get("COMPANION_URL", "").strip() or None
+if COMPANION_URL and "://" not in COMPANION_URL:
+    # render.yaml fills this with fromService/property: host, which is a BARE
+    # hostname. Pasting that straight into an error message gives the reader
+    # something they cannot click.
+    COMPANION_URL = f"https://{COMPANION_URL}"
 
 app = FastAPI(title="Luxembourg Traffic Forecast", version="2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"],
@@ -66,6 +140,29 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"],
 # Every response is JSON and compresses hard: /counters 306 KB -> 36 KB.
 # uvicorn compresses nothing of its own.
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+def _noop(fn):
+    """Leave the handler defined but unrouted on a service that is not its role."""
+    return fn
+
+
+def forecast_get(*a, **kw):
+    """@app.get, but only on an instance that holds the forecast bundles.
+
+    Registering the route and then failing inside it would be worse: the route
+    would appear in /docs and in the 404 handler's endpoint list, so a caller
+    would believe this service could answer it.
+    """
+    return app.get(*a, **kw) if SERVES_FORECAST else _noop
+
+
+def lag_get(*a, **kw):
+    return app.get(*a, **kw) if SERVES_LAG else _noop
+
+
+def lag_post(*a, **kw):
+    return app.post(*a, **kw) if SERVES_LAG else _noop
 
 MODEL_FILES = {"2024": "forecast_model_2024.pkl",
                "2024_2025": "forecast_model_2024_2025.pkl"}
@@ -107,13 +204,102 @@ def get_bundle(model: str) -> dict:
                     ROOT / "models" / MODEL_FILES[model])
     return _BUNDLES[model]
 
+# --------------------------------------------------------------------------
+# The SHORT-HORIZON model -- deliberately NOT in MODEL_FILES
+# --------------------------------------------------------------------------
+#
+# It is a different product, not a third variant of the same one, and putting
+# it in MODEL_FILES would make four existing routes lie. /models, /counters,
+# /manifest and /health all iterate MODEL_FILES and assume a manifest plus
+# "can answer any date". This model can answer NO date without 31 days of
+# observed counts supplied by the caller, and has no manifest at all.
+#
+# OPTIONAL AT IMPORT. The file may not be deployed -- scripts/deploy_to_backend.sh
+# ships it only if it has been built -- so this loads lazily and the service
+# starts fine without it. POST /forecast24h then returns 503 with the reason.
+#
+# MEMORY. app/main.py's get_bundle() comment records 327 MB resident for the two
+# forecast bundles against Render's 512 MB cap, peaking at 512 while serving.
+# This bundle is larger (28 features, not 16) at roughly 85 MB resident, which
+# would put a three-bundle process near 410 MB before serving overhead. It is
+# lazy for that reason: a deployment that never calls /forecast24h never pays
+# for it. If this endpoint goes into real use, the instance needs resizing --
+# measure before assuming otherwise.
+LAG_MODELS = {24: "forecast_model_24h.pkl", 48: "forecast_model_48h.pkl"}
+_LAG_BUNDLES: dict[int, dict] = {}
+_LAG_LOCK = threading.Lock()
+
+# MEMORY. This is why the service is split -- the SERVICE_ROLE block at the top
+# of this file has the measurements. On a SERVICE_ROLE=lag instance both leads
+# fit comfortably, 280 MB worst case against 512, so neither has to be dropped.
+#
+# Still LAZY, for two reasons that outlive the split: a service whose callers
+# only ever ask for 48h never pays for the 24h bundle, and cold start does half
+# the work, which a free plan pays for often.
+#
+# Do NOT add eviction. Dropping a bundle frees nothing -- Python returns the
+# memory to its own allocator, not to the OS -- and it re-costs the load on
+# every switch. That was measured when eviction was considered for the forecast
+# bundles, and rejected.
+#
+# If this service ever must shed a lead, drop 24h and keep 48h: docs/LEAD_LAG.md
+# 3 argues it costs ~0.5 MAE against the 24h model and keeps answering when a
+# feed slips by a day, where the 24h model refuses outright.
+
+
+def get_lag_bundle(lead: int) -> dict:
+    """The short-horizon bundle for `lead`, loaded on first use. 503 if absent."""
+    if lead not in _LAG_BUNDLES:
+        fname = LAG_MODELS[lead]
+        path = ROOT / "models" / fname
+        if not path.exists():
+            raise HTTPException(status_code=503, detail=(
+                f"the {lead}h short-horizon model is not deployed on this "
+                f"instance (no models/{fname}). The /forecast endpoints are "
+                f"unaffected. Build it with scripts/train_lag24.py --lead "
+                f"{lead} and redeploy."))
+        with _LAG_LOCK:
+            if lead not in _LAG_BUNDLES:
+                _LAG_BUNDLES[lead] = predict.load_bundle(path)
+    return _LAG_BUNDLES[lead]
+
+
+def _require_lead(lead: int) -> None:
+    """Only the leads we actually ship a bundle for."""
+    if lead not in LAG_MODELS:
+        raise HTTPException(status_code=404, detail=(
+            f"no {lead}h model. Available short-horizon leads: "
+            f"{sorted(LAG_MODELS)}. Lead is how many hours ahead the forecast "
+            f"is issued, and it fixes how stale the supplied counts may be."))
+
+
+class HistoryPoint(BaseModel):
+    t: str = Field(..., description="ISO hour, e.g. 2025-01-14T08:00:00")
+    v: float = Field(..., description="observed vehicles in that hour")
+
+
+class Forecast24hRequest(BaseModel):
+    poste_id: int
+    direction: int = Field(..., ge=1, le=2)
+    vehicule: str = Field(..., pattern="^[VC]$")
+    date: str = Field(..., description="target day, YYYY-MM-DD")
+    history: list[HistoryPoint] = Field(..., description=(
+        "observed hourly counts for THIS series, ending no more than 24h "
+        "before the target day starts. See /forecast24h/spec."))
+
+
 # What each model serves. Built by scripts/build_counter_manifest.py as EVERY
 # series the model knows, with a per-series scoreable_2025 flag rather than the
 # old intersection rule -- that rule would have left the 2024+2025 model serving
 # nothing, since no year holds both its forecast and a recorded count.
 # COUNTER_MANIFEST.md records the counts and every exclusion with its reason.
-MANIFESTS = {k: json.loads((ROOT / f"counter_manifest_{k}.json").read_text())
-             for k in MODEL_FILES}
+#
+# ROLE-GUARDED. The lag service does not ship these files -- it serves no
+# counter list and no scoreable flag -- and an unconditional read here would
+# crash it at import with a FileNotFoundError that looks like a broken deploy
+# rather than a service doing exactly what it should.
+MANIFESTS = ({k: json.loads((ROOT / f"counter_manifest_{k}.json").read_text())
+              for k in MODEL_FILES} if SERVES_FORECAST else {})
 SERVED = {k: {(c["poste_id"], c["direction"], c["vehicule"]) for c in m["served"]}
           for k, m in MANIFESTS.items()}
 # Which series have 2025 actuals, so /forecast can tell the UI up front whether
@@ -121,11 +307,11 @@ SERVED = {k: {(c["poste_id"], c["direction"], c["vehicule"]) for c in m["served"
 SCOREABLE = {k: {(c["poste_id"], c["direction"], c["vehicule"])
                  for c in m["served"] if c["scoreable_2025"]}
              for k, m in MANIFESTS.items()}
-MANIFEST = MANIFESTS[DEFAULT_MODEL]
+MANIFEST = MANIFESTS[DEFAULT_MODEL] if SERVES_FORECAST else None
 # The honest accuracy figure for the default model: the FULL unseen year,
 # not the 46-day window, which has Christmas as 2 of its 46 days and
 # overstated the last feature 4.6x. Recorded in the manifest by the builder.
-EXPECTED_MAE = MANIFEST["holdout_mae"]
+EXPECTED_MAE = MANIFEST["holdout_mae"] if SERVES_FORECAST else None
 
 
 def _pick(model: str) -> str:
@@ -172,9 +358,14 @@ def _refuse_if_trained_on(model: str, date: str) -> None:
 # than held in memory: ~30 MB most callers never ask for.
 ACTUALS = ROOT / "actuals"
 
-ENDPOINTS = [
+# Split by role, because this list is what the 404 handler and / advertise. A
+# service must never offer an endpoint it does not hold the model for.
+COMMON_ENDPOINTS = [
     {"path": "/health", "method": "GET",
      "description": "service status, model accuracy, and coverage bounds"},
+]
+
+FORECAST_ENDPOINTS = [
     {"path": "/models", "method": "GET",
      "description": "the two models, what each is for, and which dates each may forecast"},
     {"path": "/counters", "method": "GET",
@@ -195,20 +386,66 @@ ENDPOINTS = [
     {"path": "/actuals/{poste_id}", "method": "GET",
      "description": "what the counter actually recorded, hour by hour, 2025 only",
      "example": "/actuals/1410"},
-    {"path": "/docs", "method": "GET", "description": "interactive API docs"},
 ]
+
+LAG_ENDPOINTS = [
+    {"path": "/forecast/{lead}h/spec", "method": "GET",
+     "description": "how much history the short-horizon model needs, read off the bundle",
+     "example": "/forecast/48h/spec"},
+    {"path": "/forecast/{lead}h", "method": "POST",
+     "description": ("hourly forecast from observed counts the caller supplies. "
+                     "lead is how many hours ahead it is issued, and it fixes "
+                     "how stale those counts may be"),
+     "required_body": {
+         "poste_id": "counter id, e.g. 1410",
+         "direction": "1 or 2",
+         "vehicule": "V for cars, C for trucks",
+         "date": "YYYY-MM-DD",
+         "history": "[{t: ISO hour, v: vehicles}] -- see /forecast/{lead}h/spec"},
+     "example": "POST /forecast/48h"},
+]
+
+ENDPOINTS = (COMMON_ENDPOINTS
+             + (FORECAST_ENDPOINTS if SERVES_FORECAST else [])
+             + (LAG_ENDPOINTS if SERVES_LAG else [])
+             + [{"path": "/docs", "method": "GET",
+                 "description": "interactive API docs"}])
+
+
+ROLE_SUMMARY = {
+    "forecast": ("long-horizon models. Any date from a bare calendar date, no "
+                 "observed counts needed."),
+    "lag": ("short-horizon models. Needs recent observed counts supplied in the "
+            "request body; more accurate than the forecast models, but only "
+            "within its lead."),
+    "all": "both halves in one process. Local use only -- see SERVICE_ROLE.",
+}
+
+
+def _deployed_models() -> dict:
+    """What THIS instance can actually load, by role."""
+    if SERVES_FORECAST:
+        return {k: {"trained_through": MANIFESTS[k]["trained_through"][:10],
+                    "role": MANIFESTS[k]["role"]} for k in MODEL_FILES}
+    return {f"{lead}h": {"role": "short-horizon, caller supplies history",
+                         "deployed": (ROOT / "models" / f).exists()}
+            for lead, f in LAG_MODELS.items()}
 
 
 @app.get("/")
 def root():
     return {"service": "Luxembourg Traffic Forecast", "version": "3.0",
-            "models": {k: {"trained_through": MANIFESTS[k]["trained_through"][:10],
-                           "role": MANIFESTS[k]["role"]} for k in MODEL_FILES},
-            "default_model": DEFAULT_MODEL,
+            # Which half this is. A client that got the wrong URL finds out
+            # here rather than from a 404 on the route it wanted.
+            "service_role": ROLE,
+            "serves": ROLE_SUMMARY[ROLE],
+            "companion_service": COMPANION_URL,
+            "models": _deployed_models(),
+            "default_model": DEFAULT_MODEL if SERVES_FORECAST else None,
             "endpoints": ENDPOINTS}
 
 
-@app.get("/models")
+@forecast_get("/models")
 def models():
     """The two models, and the dates each one may honestly forecast.
 
@@ -246,6 +483,32 @@ def models():
                      "against 12.5% for 2024.")}
 
 
+# Paths that exist on the OTHER service. Splitting one API in two breaks
+# existing clients at exactly these paths, and a bare "Not Found" would send
+# someone hunting for a bug in their own code.
+_OTHER_ROLE_PATHS = {
+    "forecast": ("/counters", "/manifest", "/models", "/actuals", "/forecast"),
+    "lag": ("/forecast/",),          # /forecast/24h, /forecast/48h/spec
+}
+
+
+def _wrong_service_hint(path: str) -> str | None:
+    """Say so when the path belongs to the half of the API we are not."""
+    if not SERVES_LAG and path.startswith("/forecast/") and path.endswith(
+            ("h", "h/spec")):
+        where = COMPANION_URL or "the SERVICE_ROLE=lag service"
+        return (f"{path} is a SHORT-HORIZON route and this instance is "
+                f"SERVICE_ROLE={ROLE}. It lives on {where}.")
+    if not SERVES_FORECAST and any(
+            path == q or path.startswith(q.rstrip("/") + "/")
+            for q in _OTHER_ROLE_PATHS["forecast"]):
+        where = COMPANION_URL or "the SERVICE_ROLE=forecast service"
+        return (f"{path} is a LONG-HORIZON route and this instance is "
+                f"SERVICE_ROLE={ROLE}. It lives on {where}. This service "
+                f"answers /forecast/24h and /forecast/48h only.")
+    return None
+
+
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     """On an unknown path, show what could have been asked for.
@@ -256,15 +519,40 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     if exc.status_code == 404 and exc.detail == "Not Found":
         return JSONResponse(status_code=404, content={
             "error": f"Unknown path: {request.url.path}",
-            "hint": "check the spelling, or use one of the endpoints below",
+            "hint": (_wrong_service_hint(request.url.path)
+                     or "check the spelling, or use one of the endpoints below"),
+            "service_role": ROLE,
+            "companion_service": COMPANION_URL,
             "endpoints": ENDPOINTS})
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
 @app.get("/health")
 def health():
+    """Render's healthCheckPath. MUST answer on BOTH services.
+
+    It therefore reads nothing role-specific before branching: the lag service
+    has no manifest, so touching MANIFEST unconditionally here would fail the
+    health check and Render would never mark the service live.
+    """
+    if not SERVES_FORECAST:
+        return {
+            "status": "ok",
+            "service_role": ROLE,
+            "companion_service": COMPANION_URL,
+            "leads": {str(lead): {"file": f,
+                                  "deployed": (ROOT / "models" / f).exists(),
+                                  # Lazily loaded: false until something has
+                                  # actually forecast with it.
+                                  "loaded": lead in _LAG_BUNDLES}
+                      for lead, f in LAG_MODELS.items()},
+            "note": ("this service needs observed counts in the request body; "
+                     "see /forecast/{lead}h/spec for how many hours"),
+        }
     return {
         "status": "ok",
+        "service_role": ROLE,
+        "companion_service": COMPANION_URL,
         "trained_through": MANIFEST["trained_through"],
         "features": MANIFEST["features"],
         # Full unseen year, NOT the 46-day window. See EXPECTED_MAE above.
@@ -286,7 +574,7 @@ def health():
     }
 
 
-@app.get("/counters")
+@forecast_get("/counters")
 def counters(model: str = Query(DEFAULT_MODEL)):
     """Every series this model can forecast, busiest first.
 
@@ -312,7 +600,7 @@ def counters(model: str = Query(DEFAULT_MODEL)):
             "counters": out}
 
 
-@app.get("/manifest")
+@forecast_get("/manifest")
 def manifest(model: str = Query(DEFAULT_MODEL)):
     """What is served, what cannot be scored, and why.
 
@@ -329,7 +617,7 @@ def manifest(model: str = Query(DEFAULT_MODEL)):
             "excluded_actuals_only": m["excluded_actuals_only"]}
 
 
-@app.get("/actuals/{poste_id}")
+@forecast_get("/actuals/{poste_id}")
 def actuals(poste_id: int):
     """What this counter actually recorded, hour by hour, for 2025.
 
@@ -346,10 +634,17 @@ def actuals(poste_id: int):
     return FileResponse(path, media_type="application/json")
 
 
-@app.get("/forecast")
+@forecast_get("/forecast")
 def forecast(poste_id: int = Query(...), direction: int = Query(..., ge=1, le=2),
              vehicule: str = Query(..., pattern="^[VC]$"), date: str = Query(...),
-             model: str = Query(DEFAULT_MODEL)):
+             model: str = Query(DEFAULT_MODEL),
+             growth_pct: float = Query(
+                 0.0, ge=-5.0, le=5.0,
+                 description="Compound annual growth applied to the prediction, "
+                             "counted from the model's trained_through year. "
+                             "DEFAULT 0 -- the model's own zero-growth answer. "
+                             "Measured band is 0.0-1.0%/yr, central 0.5. Echoed "
+                             "in the response so the assumption is never silent.")):
     """Hourly forecast for one series on one date, from the chosen model.
 
     Two refusals, both deliberate:
@@ -377,8 +672,12 @@ def forecast(poste_id: int = Query(...), direction: int = Query(..., ge=1, le=2)
                " See /manifest for what is available.")))
 
     try:
+        # growth_pct is handed to predict.forecast_dates(), NOT applied here.
+        # ONE implementation, in the vendored forecast package. This file's own
+        # header records what duplicating prediction logic cost last time.
         out = predict.forecast_dates(poste_id, direction, vehicule, date,
-                                     bundle=get_bundle(model), quiet=True)
+                                     bundle=get_bundle(model), quiet=True,
+                                     growth_pct_per_year=growth_pct)
     except ValueError as ex:
         # Raised by the calendar-coverage guard or an unknown series. Both are
         # deliberate refusals, and the message explains which.
@@ -391,6 +690,10 @@ def forecast(poste_id: int = Query(...), direction: int = Query(..., ge=1, le=2)
                     "vehicule": vehicule},
         "model": model,
         "date": date,
+        # Echoed even when zero, so a consumer can always tell which it got.
+        "growth_pct_per_year": growth_pct,
+        "growth_base_year": (int(out["growth_base_year"].iloc[0])
+                             if "growth_base_year" in out else None),
         # Whether /actuals/{poste_id} can supply a recorded line for this date.
         # The UI shows the forecast either way and says so when it cannot score.
         "scoreable": scoreable,
@@ -416,4 +719,86 @@ def forecast(poste_id: int = Query(...), direction: int = Query(..., ge=1, le=2)
             "2025, so there is no year it has not seen. Measured against "
             "June-July 2026 roadside sensors it averages 11.4% error, "
             "against 12.5% for model=2024."),
+    }
+
+
+@lag_get("/forecast/{lead}h/spec")
+def forecast_lead_spec(lead: int):
+    """What POST /forecast24h needs, read off the bundle rather than described.
+
+    A caller that has to guess the history window will guess wrong, and the
+    failure mode -- a forecast built on too-short history -- looks like a
+    working forecast. So the requirement is served, not documented.
+    """
+    _require_lead(lead)
+    b = get_lag_bundle(lead)
+    return {
+        "kind": b["kind"],
+        "lead_hours": b["lead"],
+        "history_hours": b["history_hours"],
+        "history_days": round(b["history_hours"] / 24, 1),
+        "lag_ladder": b["lag_ladder"],
+        "trained_through": b["trained_through"],
+        "profiles_built_from": b["profiles_built_from"],
+        "blind_test_scores": b.get("scores"),
+        "rule": (
+            f"history must cover {b['history_hours']}h for this series and end "
+            f"no earlier than {b['lead']}h before the first target hour. Gaps "
+            f"are fine; staleness is refused."),
+    }
+
+
+@lag_post("/forecast/{lead}h")
+def forecast_lead(lead: int, req: Forecast24hRequest = Body(...)):
+    """Hourly forecast for one series on one date, using counts the caller sends.
+
+    Different from /forecast in the one way that matters: this model has lag
+    features, so it cannot answer a bare date. The caller supplies the recent
+    observed counts; this service holds no live data of its own.
+
+    Three refusals, all deliberate:
+      422  history too short, too stale, or the series is unknown to the model
+      503  the short-horizon bundle is not deployed on this instance
+      404  never -- an unknown series is a 422 here, because the request body
+           is what is wrong, not the URL
+    """
+    _require_lead(lead)
+    b = get_lag_bundle(lead)
+    if not req.history:
+        raise HTTPException(status_code=422, detail=(
+            f"history is empty. This model needs {b['history_hours']}h of "
+            f"observed counts; see GET /forecast/{lead}h/spec."))
+
+    hist = pd.DataFrame({"TIME_STAMP": [h.t for h in req.history],
+                         "TRAFFIC_VOLUME": [h.v for h in req.history]})
+    try:
+        out = predict.forecast_with_history(
+            req.poste_id, req.direction, req.vehicule, req.date,
+            history=hist, bundle=b, quiet=True)
+    except ValueError as ex:
+        # forecast_with_history raises for stale history, no history, and an
+        # unknown series. All three are the caller's payload, hence 422.
+        raise HTTPException(status_code=422, detail=str(ex))
+
+    # PARITY WITH /forecast, deliberately. The UI routes a date to whichever
+    # model can answer it and renders ONE report either way, so a field present
+    # on one response and absent on the other is not a cosmetic gap -- it is a
+    # panel that loses its holiday chip precisely on 1 January, the date this
+    # endpoint exists to answer. forecast_with_history() already returns the
+    # holiday columns; only this dict was dropping them.
+    holiday = bool((out["is_public_holiday"] | out["is_school_holiday"]).any())
+    return {
+        "counter": {"poste_id": req.poste_id, "direction": req.direction,
+                    "vehicule": req.vehicule},
+        "model": f"{lead}h",
+        "kind": b["kind"],
+        "date": req.date,
+        "history_hours_supplied": len(req.history),
+        "history_hours_required": b["history_hours"],
+        "is_holiday_period": holiday,
+        "daily_total": round(float(out["PREDICTED"].sum())),
+        "hourly": [{"hour": int(t.hour), "predicted": float(p),
+                    "typical_for_slot": float(n)}
+                   for t, p, n in zip(out["TIME_STAMP"], out["PREDICTED"],
+                                      out["typical_for_slot"])],
     }

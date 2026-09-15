@@ -1,0 +1,67 @@
+# The SHORT-HORIZON service. Lag models: the caller supplies recent observed
+# counts and gets a more accurate forecast within the model's lead.
+#
+# Its twin is Dockerfile (the forecast service). Same source tree, same
+# app/main.py -- only the models and the routes differ, selected by
+# SERVICE_ROLE. SPLIT_SERVICES.md says why they are separate; the short version
+# is that four bundles need ~500 MB and a Render free instance has 512 MB.
+FROM python:3.9-slim
+
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+
+# BAKED IN, not left to render.yaml -- see the same note in Dockerfile. This
+# image ships no counter manifests, so a process started here with
+# SERVICE_ROLE=forecast would crash at import reading a file that is not in it.
+ENV SERVICE_ROLE=lag
+
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY app/ ./app/
+
+# The prediction code, vendored from the training repo by
+# scripts/deploy_to_backend.sh. REQUIRED, and not only for the import in
+# app/main.py: the bundle pickles a forecast.features.Profiles dataclass, so
+# joblib.load() fails with ModuleNotFoundError without this -- which reads as a
+# corrupt model file rather than a missing package.
+COPY forecast/ ./forecast/
+
+# ONLY the two short-horizon bundles. The forecast models are 56 MB this
+# service can never route to.
+#
+# Both leads in one image is deliberate and it fits: MEASURED 82 MB idle,
+# 256 MB with one bundle loaded, 280 MB with both, against 512 MB. They are
+# still LAZY -- an instance whose callers only ever ask for 48h pays for one.
+COPY models/forecast_model_24h.pkl models/forecast_model_48h.pkl ./models/
+
+# The holiday calendar and site metadata, read at CALL TIME rather than baked
+# into the .pkl. That is what lets the calendar be extended to 2030 without
+# retraining. Needed here too: the lag models carry the same calendar features
+# as the forecast models, and without this every date fails the coverage guard.
+COPY data/external/ ./data/external/
+
+# NOT COPIED, and each omission is the point of the split:
+#   counter_manifest_*.json  derived from the FORECAST bundles. This service
+#                            serves no counter list; app/main.py guards the
+#                            read on SERVICE_ROLE so its absence is correct,
+#                            not a broken deploy.
+#   actuals/                 ~30 MB of recorded 2025 counts, served by
+#                            /actuals/{poste_id} on the forecast service.
+#                            Nothing here reads them.
+
+# NOTE on versions. requirements.txt pins numpy 2.0.2 / lightgbm 4.6.0 while the
+# model is trained against numpy 2.4.6 / lightgbm 4.7.0. Verified working -- the
+# bundle loads and predicts identically across that gap -- but pickle
+# compatibility is not guaranteed in general. If a future bundle fails to load
+# here, align these pins with the training environment before debugging
+# anything else.
+
+EXPOSE 8000
+# --workers 1, PINNED. See the long note in Dockerfile: each worker is a whole
+# separate copy of the loaded bundles. Two workers here would be ~340 MB before
+# request overhead, and the headroom this split just bought would be spent.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
