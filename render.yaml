@@ -30,11 +30,12 @@ services:
         value: forecast
       # Bare hostname from Render; app/main.py prefixes https://. Used only to
       # tell a caller that hit the wrong service where the other one is.
+      # LITERAL, not fromService. Render's `property: host` resolves to the
+      # service NAME alone -- the deployed service printed
+      # "https://luxtransport-lag-api" with no domain, so the 404 hint pointed at
+      # a host that does not exist. Measured on the live service, not assumed.
       - key: COMPANION_URL
-        fromService:
-          name: luxtransport-lag-api
-          type: web
-          property: host
+        value: https://luxtransport-lag-api.onrender.com
     #
     # Everything the container needs is committed and COPYed by the Dockerfile:
     #   models/forecast_model_2024.pkl       validation model. Trained on 2024
@@ -73,11 +74,12 @@ services:
     envVars:
       - key: SERVICE_ROLE
         value: lag
+      # LITERAL, not fromService. Render's `property: host` resolves to the
+      # service NAME alone -- the deployed service printed
+      # "https://luxtransport-api" with no domain, so the 404 hint pointed at
+      # a host that does not exist. Measured on the live service, not assumed.
       - key: COMPANION_URL
-        fromService:
-          name: luxtransport-api
-          type: web
-          property: host
+        value: https://luxtransport-api.onrender.com
     #
     # Ships ONLY:
     #   models/forecast_model_24h.pkl   lead 24: needs counts up to 24h before
