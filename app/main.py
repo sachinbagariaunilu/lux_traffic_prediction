@@ -277,6 +277,57 @@ def _require_lead(lead: int) -> None:
             f"is issued, and it fixes how stale the supplied counts may be."))
 
 
+# --------------------------------------------------------------------------
+# Server-held recent history -- what makes GET /forecast/{lead}h possible
+# --------------------------------------------------------------------------
+#
+# Built by scripts/build_lag_history.py as the last ~45 days of actuals/, one
+# small file per counter. Read per request rather than held in memory, the same
+# way /actuals does: 3.6 MB across 264 files, and a request touches one of them.
+#
+# WHAT THIS BUYS. Without it the caller had to send the counts itself, so our
+# own frontend fetched history from the FORECAST service and POSTed 55 KB of it
+# back to this one -- our data, moved between two of our own machines, through
+# the user's connection. With it the same request is a bare GET.
+#
+# WHAT IT IS NOT. Not `data/live`, and it does not make these models generally
+# servable. It is a frozen snapshot of the tail of the recording, so it can
+# answer only dates within one lead of where the data stops -- 2026-01-01 and
+# 2026-01-02 today. Anything later needs a real feed. See LEAD_LAG.md.
+HISTORY = ROOT / "data" / "history"
+
+
+def load_history(poste_id: int, direction: int, vehicule: str) -> pd.DataFrame:
+    """This series' recent counts, as forecast_with_history() wants them.
+
+    Raises HTTPException rather than returning empty: every failure here is a
+    different thing the caller needs told apart -- no snapshot deployed at all,
+    no file for this counter, no rows for this series.
+    """
+    if not HISTORY.is_dir():
+        raise HTTPException(status_code=503, detail=(
+            "no recent-history snapshot is deployed on this instance, so this "
+            "endpoint cannot assemble the counts itself. Send them in the body "
+            f"with POST /forecast/{{lead}}h instead, or rebuild the snapshot "
+            "with scripts/build_lag_history.py."))
+    path = HISTORY / f"{poste_id}.json"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=(
+            f"no recent history for counter {poste_id}. It may have stopped "
+            f"reporting before the snapshot window; POST /forecast/{{lead}}h "
+            f"with your own counts still works."))
+    blob = json.loads(path.read_text())
+    days = blob.get("series", {}).get(f"{direction}-{vehicule}")
+    if not days:
+        raise HTTPException(status_code=404, detail=(
+            f"counter {poste_id} has no recent history for direction "
+            f"{direction}, vehicle {vehicule!r}. Available: "
+            f"{sorted(blob.get('series', {}))}"))
+    rows = [(f"{day}T{hour:02d}:00:00", float(v))
+            for day in sorted(days) for hour, v in enumerate(days[day])]
+    return pd.DataFrame(rows, columns=["TIME_STAMP", "TRAFFIC_VOLUME"])
+
+
 class HistoryPoint(BaseModel):
     t: str = Field(..., description="ISO hour, e.g. 2025-01-14T08:00:00")
     v: float = Field(..., description="observed vehicles in that hour")
@@ -396,10 +447,20 @@ LAG_ENDPOINTS = [
     {"path": "/forecast/{lead}h/spec", "method": "GET",
      "description": "how much history the short-horizon model needs, read off the bundle",
      "example": "/forecast/48h/spec"},
+    {"path": "/forecast/{lead}h", "method": "GET",
+     "description": ("hourly forecast using the recent counts this service "
+                     "already holds -- no payload. Only dates within one lead "
+                     "of where that snapshot ends can be answered"),
+     "required_params": {
+         "poste_id": "counter id, e.g. 1410",
+         "direction": "1 or 2",
+         "vehicule": "V for cars, C for trucks",
+         "date": "YYYY-MM-DD"},
+     "example": "/forecast/24h?poste_id=1410&direction=1&vehicule=V&date=2026-01-01"},
     {"path": "/forecast/{lead}h", "method": "POST",
-     "description": ("hourly forecast from observed counts the caller supplies. "
-                     "lead is how many hours ahead it is issued, and it fixes "
-                     "how stale those counts may be"),
+     "description": ("same, but from counts YOU supply -- for a caller whose "
+                     "feed is fresher than ours. lead is how many hours ahead "
+                     "it is issued, and it fixes how stale those counts may be"),
      "required_body": {
          "poste_id": "counter id, e.g. 1410",
          "direction": "1 or 2",
@@ -752,13 +813,87 @@ def forecast_lead_spec(lead: int):
     }
 
 
+def _lag_forecast(lead: int, b: dict, poste_id: int, direction: int,
+                  vehicule: str, date: str, hist: pd.DataFrame,
+                  history_source: str) -> dict:
+    """The answer, shared by the GET and POST forms.
+
+    ONE implementation on purpose. The two routes differ only in where the
+    counts came from, and the moment that difference is allowed to fork the
+    response-building the two will drift -- which is the exact failure this
+    file's header records from the last time prediction logic was duplicated.
+    """
+    try:
+        out = predict.forecast_with_history(
+            poste_id, direction, vehicule, date, history=hist, bundle=b, quiet=True)
+    except ValueError as ex:
+        # Stale history, too little history, unknown series. All three are about
+        # the DATA, not the URL -- 422 whichever route asked.
+        raise HTTPException(status_code=422, detail=str(ex))
+
+    # PARITY WITH /forecast, deliberately. The UI routes a date to whichever
+    # model can answer it and renders ONE report either way, so a field present
+    # on one response and absent on the other is not a cosmetic gap -- it is a
+    # panel that loses its holiday chip precisely on 1 January, the date these
+    # models exist to answer.
+    holiday = bool((out["is_public_holiday"] | out["is_school_holiday"]).any())
+    return {
+        "counter": {"poste_id": poste_id, "direction": direction,
+                    "vehicule": vehicule},
+        "model": f"{lead}h",
+        "kind": b["kind"],
+        "date": date,
+        # Which of the two ways the counts arrived. Worth stating: a caller that
+        # believes it sent its own fresh counts, and is silently being answered
+        # from a frozen snapshot, would misread the result.
+        "history_source": history_source,
+        # The last hour of real traffic behind this forecast. The UI states it
+        # ("given real counts to 31 December"), and with the GET form the caller
+        # no longer holds the history itself, so it cannot work this out.
+        "history_through": str(pd.to_datetime(hist["TIME_STAMP"]).max())[:19],
+        "history_hours_supplied": len(hist),
+        "history_hours_required": b["history_hours"],
+        "is_holiday_period": holiday,
+        "daily_total": round(float(out["PREDICTED"].sum())),
+        "hourly": [{"hour": int(t.hour), "predicted": float(p),
+                    "typical_for_slot": float(n)}
+                   for t, p, n in zip(out["TIME_STAMP"], out["PREDICTED"],
+                                      out["typical_for_slot"])],
+    }
+
+
+@lag_get("/forecast/{lead}h")
+def forecast_lead_get(lead: int, poste_id: int = Query(...),
+                      direction: int = Query(..., ge=1, le=2),
+                      vehicule: str = Query(..., pattern="^[VC]$"),
+                      date: str = Query(...)):
+    """Short-horizon forecast using the counts THIS SERVICE already holds.
+
+    The same answer as POST /forecast/{lead}h, with no payload: the service
+    reads the recent history itself. That is the whole point -- the POST form
+    made our own frontend fetch 55 KB of our own data and send it back to us.
+
+    Only dates within one lead of where the snapshot ends can be answered, so
+    this is 2026-01-01 and 2026-01-02 today. Later dates get a 422 naming how
+    stale the snapshot is, which is the honest answer until a feed exists.
+
+    POST remains the right call for anyone whose own counts are fresher than
+    ours -- an operator with a live feed.
+    """
+    _require_lead(lead)
+    b = get_lag_bundle(lead)
+    hist = load_history(poste_id, direction, vehicule)
+    return _lag_forecast(lead, b, poste_id, direction, vehicule, date, hist,
+                         history_source="server snapshot")
+
+
 @lag_post("/forecast/{lead}h")
 def forecast_lead(lead: int, req: Forecast24hRequest = Body(...)):
-    """Hourly forecast for one series on one date, using counts the caller sends.
+    """Short-horizon forecast from counts the CALLER supplies.
 
-    Different from /forecast in the one way that matters: this model has lag
-    features, so it cannot answer a bare date. The caller supplies the recent
-    observed counts; this service holds no live data of its own.
+    Use this when your own counts are fresher than ours -- an operator with a
+    live feed. When they are not, GET /forecast/{lead}h is the same answer with
+    no payload.
 
     Three refusals, all deliberate:
       422  history too short, too stale, or the series is unknown to the model
@@ -771,38 +906,10 @@ def forecast_lead(lead: int, req: Forecast24hRequest = Body(...)):
     if not req.history:
         raise HTTPException(status_code=422, detail=(
             f"history is empty. This model needs {b['history_hours']}h of "
-            f"observed counts; see GET /forecast/{lead}h/spec."))
+            f"observed counts; see GET /forecast/{lead}h/spec. If you have no "
+            f"counts of your own, GET /forecast/{lead}h uses ours."))
 
     hist = pd.DataFrame({"TIME_STAMP": [h.t for h in req.history],
                          "TRAFFIC_VOLUME": [h.v for h in req.history]})
-    try:
-        out = predict.forecast_with_history(
-            req.poste_id, req.direction, req.vehicule, req.date,
-            history=hist, bundle=b, quiet=True)
-    except ValueError as ex:
-        # forecast_with_history raises for stale history, no history, and an
-        # unknown series. All three are the caller's payload, hence 422.
-        raise HTTPException(status_code=422, detail=str(ex))
-
-    # PARITY WITH /forecast, deliberately. The UI routes a date to whichever
-    # model can answer it and renders ONE report either way, so a field present
-    # on one response and absent on the other is not a cosmetic gap -- it is a
-    # panel that loses its holiday chip precisely on 1 January, the date this
-    # endpoint exists to answer. forecast_with_history() already returns the
-    # holiday columns; only this dict was dropping them.
-    holiday = bool((out["is_public_holiday"] | out["is_school_holiday"]).any())
-    return {
-        "counter": {"poste_id": req.poste_id, "direction": req.direction,
-                    "vehicule": req.vehicule},
-        "model": f"{lead}h",
-        "kind": b["kind"],
-        "date": req.date,
-        "history_hours_supplied": len(req.history),
-        "history_hours_required": b["history_hours"],
-        "is_holiday_period": holiday,
-        "daily_total": round(float(out["PREDICTED"].sum())),
-        "hourly": [{"hour": int(t.hour), "predicted": float(p),
-                    "typical_for_slot": float(n)}
-                   for t, p, n in zip(out["TIME_STAMP"], out["PREDICTED"],
-                                      out["typical_for_slot"])],
-    }
+    return _lag_forecast(lead, b, req.poste_id, req.direction, req.vehicule,
+                         req.date, hist, history_source="caller-supplied")

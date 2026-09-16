@@ -44,6 +44,14 @@ COPY models/forecast_model_24h.pkl models/forecast_model_48h.pkl ./models/
 # as the forecast models, and without this every date fails the coverage guard.
 COPY data/external/ ./data/external/
 
+# The recent-history snapshot, built by scripts/build_lag_history.py from the
+# forecast service's actuals/. 3.6 MB across 264 counter files, read one file
+# per request rather than held in memory.
+#
+# This is what lets GET /forecast/{lead}h work with no payload. Without it that
+# route answers 503 and only the POST form works -- the service still starts.
+COPY data/history/ ./data/history/
+
 # NOT COPIED, and each omission is the point of the split:
 #   counter_manifest_*.json  derived from the FORECAST bundles. This service
 #                            serves no counter list; app/main.py guards the

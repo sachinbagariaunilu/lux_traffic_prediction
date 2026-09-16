@@ -8,6 +8,12 @@ data/
 # metadata, read at CALL TIME by forecast.calendar_lux, so the container cannot
 # start without it. Negation must follow the exclusion above.
 !data/external/
+# ...and data/history/ for the same reason: it is the recent-count snapshot the
+# lag service reads at CALL TIME to answer GET /forecast/{lead}h without a
+# payload. Built by scripts/build_lag_history.py, not source data. Without this
+# negation the `data/` rule above strips it from the build context and
+# Dockerfile.lag's COPY fails the build outright.
+!data/history/
 *.ipynb
 notebooks/
 
