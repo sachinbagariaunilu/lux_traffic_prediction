@@ -97,6 +97,19 @@ data/*
 # not descend into an excluded directory to find the files inside it.
 !data/external/
 !data/external/*.json
+# ...and data/history/, for the same reason and with the same two-line shape.
+# It is the recent-count snapshot the LAG service reads at call time to answer
+# GET /forecast/{lead}h without a payload -- built by
+# scripts/build_lag_history.py from actuals/, so derived rather than source.
+#
+# THIS IS NOT OPTIONAL. Render builds the image from this repo, so a file left
+# ignored here is absent from the build context and `COPY data/history/` in
+# Dockerfile.lag fails the BUILD -- not the request. Render then keeps the
+# previous deploy serving, so the symptom is "my change did nothing" and a live
+# service answering 405 on a route that exists in main. That is precisely how
+# this was found. 3.6 MB across 264 files.
+!data/history/
+!data/history/*.json
 
 # Logs
 *.log
